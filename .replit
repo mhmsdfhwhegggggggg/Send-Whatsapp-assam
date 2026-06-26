@@ -18,3 +18,11 @@ expertMode = true
 [postMerge]
 path = "scripts/post-merge.sh"
 timeoutMs = 20000
+
+[userenv]
+
+[userenv.shared]
+JWT_SECRET = "464de744c47cdc665a413c95760a91f723ef495f696068d9a080420d6dd941e77a6bbf533a05474a799d8ebc3b5dbe04"
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "AlMossah@2025!"
+WORKER_URL = "http://localhost:8088"
