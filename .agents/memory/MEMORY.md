@@ -1,0 +1,3 @@
+- [API Server PORT issue](api-server-port.md) — workflow لا يمرر PORT تلقائياً للـ dev script، يجب تضمينه صريحاً في أمر الـ workflow
+- [Baileys blocked](whatsapp-lib.md) — @whiskeysockets/baileys محظورة في Replit، البديل whatsapp-web.js
+- [Workflow kill pattern](workflow-kill.md) — عند restart الـ workflow، يجب قتل العملية القديمة أولاً
