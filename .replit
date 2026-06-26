@@ -78,3 +78,6 @@ JWT_SECRET = "464de744c47cdc665a413c95760a91f723ef495f696068d9a080420d6dd941e77a
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "AlMossah@2025!"
 WORKER_URL = "http://localhost:8088"
+
+[nix]
+channel = "stable-25_05"

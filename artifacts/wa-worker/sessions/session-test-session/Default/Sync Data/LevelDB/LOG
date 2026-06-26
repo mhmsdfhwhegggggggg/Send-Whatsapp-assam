@@ -1,0 +1,2 @@
+2026/06/26-21:30:33.797 ecc Creating DB /home/runner/workspace/artifacts/wa-worker/sessions/session-test-session/Default/Sync Data/LevelDB since it was missing.
+2026/06/26-21:30:34.018 ecc Reusing MANIFEST /home/runner/workspace/artifacts/wa-worker/sessions/session-test-session/Default/Sync Data/LevelDB/MANIFEST-000001

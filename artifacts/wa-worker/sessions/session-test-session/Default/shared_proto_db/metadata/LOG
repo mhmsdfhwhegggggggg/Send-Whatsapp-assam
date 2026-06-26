@@ -1,0 +1,2 @@
+2026/06/26-21:30:35.063 ecc Creating DB /home/runner/workspace/artifacts/wa-worker/sessions/session-test-session/Default/shared_proto_db/metadata since it was missing.
+2026/06/26-21:30:35.092 ecc Reusing MANIFEST /home/runner/workspace/artifacts/wa-worker/sessions/session-test-session/Default/shared_proto_db/metadata/MANIFEST-000001
