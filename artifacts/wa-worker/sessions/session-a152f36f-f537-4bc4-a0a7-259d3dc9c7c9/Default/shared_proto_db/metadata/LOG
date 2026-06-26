@@ -1,0 +1,2 @@
+2026/06/26-21:52:25.664 14ff Creating DB /home/runner/workspace/artifacts/wa-worker/sessions/session-a152f36f-f537-4bc4-a0a7-259d3dc9c7c9/Default/shared_proto_db/metadata since it was missing.
+2026/06/26-21:52:25.761 14ff Reusing MANIFEST /home/runner/workspace/artifacts/wa-worker/sessions/session-a152f36f-f537-4bc4-a0a7-259d3dc9c7c9/Default/shared_proto_db/metadata/MANIFEST-000001
