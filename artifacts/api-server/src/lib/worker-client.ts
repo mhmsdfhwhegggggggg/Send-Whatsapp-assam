@@ -59,14 +59,40 @@ export async function workerGetAllSessions(): Promise<Record<string, SessionStat
 }
 
 /**
+ * Check if a phone number is registered on WhatsApp.
+ * Call this BEFORE sending to avoid error spikes on invalid numbers.
+ * Returns true = registered, false = not on WhatsApp or worker unavailable.
+ *
+ * This is one of the most important anti-ban signals: sending to non-WA
+ * numbers raises your error rate and triggers spam detection faster.
+ */
+export async function workerCheckPhone(
+  sessionId: string,
+  phone: string,
+): Promise<{ registered: boolean; error?: string }> {
+  try {
+    const res = await workerFetch("/check-phone", {
+      method: "POST",
+      body: JSON.stringify({ sessionId, phone }),
+    });
+    if (!res.ok) return { registered: true }; // Fail open: don't block on worker issues
+    const body = await res.json() as { registered: boolean };
+    return body;
+  } catch (e) {
+    // Worker unreachable — fail open (don't block the campaign)
+    logger.warn({ sessionId, phone, err: (e as Error).message }, "check-phone: worker unreachable");
+    return { registered: true };
+  }
+}
+
+/**
  * Send a message through the worker.
  * humanMode=true (default) tells the worker to:
  *   1. Mark the chat as read
- *   2. Show typing indicator for realistic duration
- *   3. Brief hesitation
- *   4. Then actually send
- *
- * This is the single most visible anti-ban signal at the protocol level.
+ *   2. Show typing indicator for realistic duration (corrected Arabic speed)
+ *   3. Multi-phase typing simulation with mid-message pause for long texts
+ *   4. Brief review hesitation
+ *   5. Then actually send
  */
 export async function workerSendMessage(
   sessionId: string,

@@ -41,24 +41,33 @@ router.get("/accounts", async (_req, res) => {
 
   const result = accounts.map((a) => {
     const s = sessions[a.id];
-    // Compute warm-up tier label so the UI can display it
     const ageDays = Math.floor(
       (Date.now() - new Date(a.createdAt).getTime()) / (1000 * 60 * 60 * 24),
     );
     const tier =
-      ageDays >= 30 && a.totalReplies >= 20
-        ? "hot"
-        : ageDays >= 7
-          ? "warm"
-          : "new";
+      ageDays >= 30 && a.totalReplies >= 20 ? "hot"
+      : ageDays >= 7 ? "warm"
+      : "new";
+
+    const isSuspended = a.suspendedUntil
+      ? new Date(a.suspendedUntil) > new Date()
+      : false;
 
     return {
       ...a,
       proxy: a.proxy ?? null,
+      // Mask proxy credentials before sending to frontend
+      proxyMasked: a.proxy
+        ? a.proxy.replace(/\/\/([^:]+):([^@]+)@/, "//***:***@")
+        : null,
+      hasProxy: !!a.proxy,
       status: s?.status ?? a.status,
       phoneNumber: s?.phone ?? a.phoneNumber,
       warmUpTier: tier,
       warmUpDay: a.warmUpDay,
+      healthScore: a.healthScore ?? 100,
+      isSuspended,
+      suspendedUntil: a.suspendedUntil ?? null,
     };
   });
 
@@ -73,13 +82,32 @@ router.post("/accounts", async (req, res) => {
     return;
   }
 
+  // Proxy is strongly recommended — warn but don't block if omitted.
+  // In production, every account MUST have its own residential proxy
+  // (different IP per account) to avoid multi-account detection.
+  // Format: http://user:pass@host:port
+  const proxyWarning = !proxy?.trim()
+    ? "⚠️ لم يتم تقديم proxy. يُوصى بشدة باستخدام proxy سكني مستقل لكل حساب لتجنب الحظر."
+    : null;
+
+  if (proxy?.trim()) {
+    // Basic proxy URL validation
+    try {
+      const url = new URL(proxy.trim());
+      if (!["http:", "https:", "socks5:"].includes(url.protocol)) {
+        res.status(400).json({ error: "Proxy يجب أن يكون بصيغة http://user:pass@host:port" });
+        return;
+      }
+    } catch {
+      res.status(400).json({ error: "صيغة Proxy غير صحيحة. يجب أن تكون: http://user:pass@host:port" });
+      return;
+    }
+  }
+
   const [acc] = await db
     .insert(accountsTable)
     .values({
       label: label.trim(),
-      // proxy is optional — if provided it should be a full URL like
-      // "http://user:pass@host:port". Each account should have its own
-      // residential proxy to avoid sharing an IP across sessions.
       proxy: proxy?.trim() || null,
     })
     .returning();
@@ -91,7 +119,7 @@ router.post("/accounts", async (req, res) => {
   }
 
   sessionCache = {};
-  res.status(201).json(acc);
+  res.status(201).json({ ...acc, warning: proxyWarning });
 });
 
 /* ── GET /accounts/:id/qr ───────────────────────────────────────────── */
@@ -132,6 +160,22 @@ router.delete("/accounts/:id", async (req, res) => {
   await workerDeleteSession(req.params.id);
   sessionCache = {};
   res.json({ ok: true });
+});
+
+/* ── POST /accounts/:id/unsuspend ───────────────────────────────────── */
+// Manually clear a suspension (admin override)
+router.post("/accounts/:id/unsuspend", async (req, res) => {
+  const rows = await db
+    .update(accountsTable)
+    .set({ suspendedUntil: null, healthScore: 60 }) // Restore to 60 (still degraded but usable)
+    .where(eq(accountsTable.id, req.params.id))
+    .returning();
+
+  if (rows.length === 0) {
+    res.status(404).json({ error: "Account not found" });
+    return;
+  }
+  res.json({ ok: true, message: "تم رفع الإيقاف — تم إعادة تعيين درجة الصحة إلى 60" });
 });
 
 export default router;

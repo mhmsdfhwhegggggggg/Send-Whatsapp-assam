@@ -379,6 +379,34 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+
+    // POST /check-phone  { sessionId, phone }
+    // Verify if a phone number is registered on WhatsApp BEFORE sending.
+    // This is a critical anti-ban measure: sending to non-WA numbers raises
+    // the error rate and triggers WhatsApp spam detection faster.
+    // Returns { registered: bool } — fail-open on any error.
+    if (req.method === 'POST' && parts[0] === 'check-phone') {
+      const body = await readBody(req);
+      const { sessionId, phone } = body;
+      if (!sessionId || !phone) {
+        respond(res, 400, { error: 'sessionId, phone required' }); return;
+      }
+      const s = sessions.get(sessionId);
+      if (!s || s.status !== 'connected' || !s.client) {
+        // Fail open: session not ready → don't block campaign
+        respond(res, 200, { registered: true, reason: 'session_not_connected' }); return;
+      }
+      try {
+        const chatId = phone.includes('@') ? phone : `${phone}@c.us`;
+        const contact = await s.client.getNumberId(chatId);
+        respond(res, 200, { registered: !!contact });
+      } catch (e) {
+        log('warn', 'check-phone error', { phone, err: e.message });
+        respond(res, 200, { registered: true, reason: 'check_error' });
+      }
+      return;
+    }
+
     respond(res, 404, { error: "Not found" });
   } catch (err) {
     log("error", "request error", { err: err.message, stack: err.stack?.split("\n")[1] });
