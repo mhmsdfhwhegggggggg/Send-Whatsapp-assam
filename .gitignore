@@ -47,3 +47,6 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# WhatsApp Worker — Puppeteer session data (large binary files)
+artifacts/wa-worker/sessions/

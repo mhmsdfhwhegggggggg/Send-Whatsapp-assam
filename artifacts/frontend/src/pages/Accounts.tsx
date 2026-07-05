@@ -3,21 +3,36 @@ import api from "@/lib/api";
 import { toast } from "sonner";
 import {
   Plus, Smartphone, Trash2, QrCode, CheckCircle2,
-  AlertCircle, Loader2, RefreshCw, WifiOff,
+  AlertCircle, Loader2, RefreshCw, WifiOff, Shield, Flame, Sprout, Sparkles,
 } from "lucide-react";
 
 interface Account {
-  id: string; label: string; phoneNumber?: string; status: string; sentToday: number;
+  id: string;
+  label: string;
+  phoneNumber?: string;
+  proxy?: string;
+  status: string;
+  sentToday: number;
+  warmUpDay: number;
+  warmUpTier: "new" | "warm" | "hot";
+  totalReplies: number;
+  totalSent: number;
 }
 interface QrData { qr?: string; status: string; }
 
 const STATUS_MAP: Record<string, { label: string; color: string; icon: string }> = {
-  connected:    { label: "متصل",               color: "text-emerald-700 bg-emerald-50 border-emerald-200", icon: "check" },
-  qr:           { label: "انتظر المسح",        color: "text-blue-700 bg-blue-50 border-blue-200",         icon: "qr" },
-  initializing: { label: "جاري التهيئة...",    color: "text-amber-700 bg-amber-50 border-amber-200",      icon: "spin" },
-  error:        { label: "خطأ في التهيئة",     color: "text-red-700 bg-red-50 border-red-200",            icon: "err" },
-  disconnected: { label: "غير متصل",           color: "text-slate-600 bg-slate-100 border-slate-200",     icon: "off" },
-  logged_out:   { label: "تم تسجيل الخروج",   color: "text-red-700 bg-red-50 border-red-200",            icon: "err" },
+  connected:    { label: "متصل",             color: "text-emerald-700 bg-emerald-50 border-emerald-200", icon: "check" },
+  qr:           { label: "انتظر المسح",      color: "text-blue-700 bg-blue-50 border-blue-200",         icon: "qr"    },
+  initializing: { label: "جاري التهيئة...",  color: "text-amber-700 bg-amber-50 border-amber-200",      icon: "spin"  },
+  error:        { label: "خطأ في التهيئة",   color: "text-red-700 bg-red-50 border-red-200",            icon: "err"   },
+  disconnected: { label: "غير متصل",         color: "text-slate-600 bg-slate-100 border-slate-200",     icon: "off"   },
+  logged_out:   { label: "تم تسجيل الخروج", color: "text-red-700 bg-red-50 border-red-200",            icon: "err"   },
+};
+
+const TIER_MAP = {
+  new:  { label: "🆕 جديد",  color: "text-blue-700 bg-blue-50 border-blue-200" },
+  warm: { label: "🌱 دافئ",  color: "text-amber-700 bg-amber-50 border-amber-200" },
+  hot:  { label: "🔥 ساخن",  color: "text-red-700 bg-red-50 border-red-200" },
 };
 
 function StatusBadge({ status }: { status: string }) {
@@ -34,30 +49,42 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
+function TierBadge({ tier }: { tier: "new" | "warm" | "hot" }) {
+  const t = TIER_MAP[tier] ?? TIER_MAP.new;
+  return (
+    <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium border ${t.color}`}>
+      {t.label}
+    </span>
+  );
+}
+
 export default function Accounts() {
-  const [list, setList]           = useState<Account[]>([]);
-  const [open, setOpen]           = useState(false);
-  const [label, setLabel]         = useState("");
-  const [saving, setSaving]       = useState(false);
-  const [qrOpen, setQrOpen]       = useState(false);
-  const [qrData, setQrData]       = useState<QrData | null>(null);
-  const [activeId, setActiveId]   = useState<string | null>(null);
-  const [initSec, setInitSec]     = useState(0);
-  const timerRef                  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [list, setList]         = useState<Account[]>([]);
+  const [open, setOpen]         = useState(false);
+  const [label, setLabel]       = useState("");
+  const [proxy, setProxy]       = useState("");
+  const [saving, setSaving]     = useState(false);
+  const [qrOpen, setQrOpen]     = useState(false);
+  const [qrData, setQrData]     = useState<QrData | null>(null);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [initSec, setInitSec]   = useState(0);
+  const timerRef                = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const load = () =>
-    api.get("/accounts").then(r => setList(r.data as Account[])).catch(() => {});
+    api.get("/accounts").then((r) => setList(r.data as Account[])).catch(() => {});
 
-  useEffect(() => { load(); const t = setInterval(load, 4000); return () => clearInterval(t); }, []);
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 4000);
+    return () => clearInterval(t);
+  }, []);
 
   /* QR polling */
   useEffect(() => {
     if (!qrOpen || !activeId) return;
-
     setInitSec(0);
-    const ticker = setInterval(() => setInitSec(s => s + 1), 1000);
+    const ticker = setInterval(() => setInitSec((s) => s + 1), 1000);
     timerRef.current = ticker;
-
     const poll = setInterval(async () => {
       try {
         const r = await api.get(`/accounts/${activeId}/qr`);
@@ -70,7 +97,6 @@ export default function Accounts() {
         }
       } catch {}
     }, 1500);
-
     return () => { clearInterval(ticker); clearInterval(poll); };
   }, [qrOpen, activeId]);
 
@@ -78,215 +104,216 @@ export default function Accounts() {
     if (!label.trim()) return toast.error("اسم الحساب مطلوب");
     setSaving(true);
     try {
-      const r = await api.post("/accounts", { label });
+      const r = await api.post("/accounts", {
+        label,
+        proxy: proxy.trim() || undefined,
+      });
       toast.success("تم إنشاء الحساب — جاري تحضير رمز QR (30-60 ثانية)");
-      setOpen(false); setLabel("");
+      setOpen(false);
+      setLabel("");
+      setProxy("");
       setActiveId((r.data as Account).id);
       setQrData(null);
       setQrOpen(true);
       load();
-    } catch { toast.error("فشل الإنشاء"); }
-    finally { setSaving(false); }
+    } catch {
+      toast.error("فشل الإنشاء");
+    } finally {
+      setSaving(false);
+    }
   };
 
   const del = async (id: string) => {
     if (!window.confirm("حذف هذا الحساب وقطع اتصاله؟")) return;
-    await api.delete(`/accounts/${id}`); load();
+    await api.delete(`/accounts/${id}`);
+    load();
   };
 
-  const showQr = (id: string) => {
-    setActiveId(id); setQrData(null); setQrOpen(true);
+  const openQr = (id: string) => {
+    setActiveId(id);
+    setQrData(null);
+    setQrOpen(true);
   };
-
-  /* Estimated time display */
-  const estimatedTotal = 45;
-  const pct = Math.min((initSec / estimatedTotal) * 100, 95);
 
   return (
-    <div className="space-y-6">
-      <header className="flex items-center justify-between">
+    <div className="space-y-6" dir="rtl">
+      <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-black">حسابات واتساب</h1>
           <p className="text-sm text-slate-500 mt-1">
-            اربط عدة حسابات لتوزيع حمل الإرسال — كل حساب يحتاج 30-60 ثانية للتهيئة
+            كل حساب يحتاج Proxy مختلف لتجنب الحظر
           </p>
         </div>
         <button
           onClick={() => setOpen(true)}
-          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-[#1B7A3D] text-white text-sm font-medium hover:bg-[#145D2E] transition-colors"
+          className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-[#1B7A3D] text-white font-medium hover:bg-[#145D2E] transition-colors text-sm"
         >
-          <Plus className="w-4 h-4" /> ربط حساب جديد
+          <Plus className="w-4 h-4" /> إضافة حساب
         </button>
-      </header>
+      </div>
 
-      {/* Info banner */}
-      <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 text-sm text-blue-800 flex gap-3">
-        <Loader2 className="w-5 h-5 shrink-0 mt-0.5 text-blue-600" />
-        <div>
-          <strong>كيفية ربط الحساب:</strong> اضغط "ربط حساب جديد" ← انتظر 30-60 ثانية حتى يظهر رمز QR ← افتح
-          واتساب على هاتفك ← الإعدادات ← الأجهزة المرتبطة ← ربط جهاز ← امسح الرمز
+      {/* Proxy warning banner */}
+      <div className="flex items-start gap-3 p-4 rounded-xl bg-amber-50 border border-amber-200">
+        <Shield className="w-5 h-5 text-amber-600 mt-0.5 shrink-0" />
+        <div className="text-sm text-amber-800">
+          <strong>تحذير مهم:</strong> كل حساب يجب أن يستخدم Proxy مختلف (residential proxy).
+          استخدام نفس IP لعدة حسابات يؤدي للحظر الفوري. بدون Proxy، الحسابات معرضة للحظر.
         </div>
       </div>
 
-      <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
+      {/* Account cards */}
+      <div className="grid gap-4">
         {list.length === 0 && (
-          <div className="bg-white rounded-xl border border-slate-200 p-12 col-span-full text-center">
-            <Smartphone className="w-12 h-12 mx-auto text-slate-300 mb-3" />
-            <p className="text-slate-500 font-medium">لا توجد حسابات مربوطة</p>
-            <p className="text-slate-400 text-sm mt-1">اضغط "ربط حساب جديد" للبدء</p>
+          <div className="text-center py-16 text-slate-400">
+            <Smartphone className="w-12 h-12 mx-auto mb-3 opacity-30" />
+            <p>لا توجد حسابات بعد. أضف أول حساب.</p>
           </div>
         )}
-        {list.map(a => (
-          <div key={a.id} className="bg-white rounded-xl border border-slate-200 p-5 hover:shadow-md transition-shadow">
-            <div className="flex items-start justify-between mb-3">
-              <div className="w-10 h-10 rounded-xl bg-[#E8F5EE] text-[#1B7A3D] flex items-center justify-center">
-                <Smartphone className="w-5 h-5" />
+        {list.map((a) => (
+          <div
+            key={a.id}
+            className="bg-white rounded-xl border border-slate-200 p-5 flex items-center gap-4"
+          >
+            <div className="w-10 h-10 rounded-full bg-[#1B7A3D]/10 flex items-center justify-center shrink-0">
+              <Smartphone className="w-5 h-5 text-[#1B7A3D]" />
+            </div>
+
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="font-semibold text-sm">{a.label}</span>
+                <StatusBadge status={a.status} />
+                <TierBadge tier={a.warmUpTier ?? "new"} />
               </div>
-              <div className="flex gap-1">
-                {a.status !== "connected" && (
-                  <button
-                    onClick={() => showQr(a.id)}
-                    title="عرض QR"
-                    className="p-1.5 rounded hover:bg-slate-100 text-slate-600"
-                  >
-                    <RefreshCw className="w-4 h-4" />
-                  </button>
-                )}
-                <button onClick={() => del(a.id)} className="p-1.5 rounded hover:bg-red-50 text-red-500">
-                  <Trash2 className="w-4 h-4" />
-                </button>
+              <div className="flex items-center gap-4 mt-1.5 text-xs text-slate-500 flex-wrap">
+                {a.phoneNumber && <span dir="ltr">{a.phoneNumber}</span>}
+                <span>يوم التدرج: {a.warmUpDay}</span>
+                <span>مُرسَل اليوم: {a.sentToday}</span>
+                <span>ردود: {a.totalReplies}</span>
+                <span>إجمالي: {a.totalSent}</span>
+                {a.proxy
+                  ? <span className="text-emerald-600 font-medium">✓ Proxy مُفعَّل</span>
+                  : <span className="text-red-500 font-medium">⚠ بدون Proxy</span>}
               </div>
             </div>
 
-            <h3 className="font-bold text-lg mb-0.5">{a.label}</h3>
-            {a.phoneNumber && (
-              <p className="text-sm text-slate-500 tabular-nums mb-2" dir="ltr">{a.phoneNumber}</p>
-            )}
-
-            <div className="flex items-center justify-between mt-3">
-              <StatusBadge status={a.status} />
-              <span className="text-xs text-slate-400">
-                اليوم: <span className="font-semibold tabular-nums text-slate-600">{a.sentToday ?? 0}</span>
-              </span>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                onClick={() => openQr(a.id)}
+                className="p-2 rounded-lg border border-slate-200 hover:bg-slate-50 text-slate-600 transition-colors"
+                title="عرض QR"
+              >
+                <QrCode className="w-4 h-4" />
+              </button>
+              <button
+                onClick={() => del(a.id)}
+                className="p-2 rounded-lg border border-red-100 hover:bg-red-50 text-red-500 transition-colors"
+                title="حذف"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
             </div>
           </div>
         ))}
       </div>
 
-      {/* Add Account Modal */}
+      {/* Add account modal */}
       {open && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-          onClick={() => !saving && setOpen(false)}
-        >
-          <div
-            className="bg-white rounded-xl p-6 w-full max-w-sm mx-4 space-y-4"
-            dir="rtl"
-            onClick={e => e.stopPropagation()}
-          >
-            <h2 className="text-lg font-bold">ربط حساب واتساب جديد</h2>
+        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4" onClick={() => setOpen(false)}>
+          <div className="bg-white rounded-2xl p-6 w-full max-w-md space-y-4 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-xl font-bold">إضافة حساب واتساب جديد</h2>
+
             <div>
-              <label className="block text-sm font-medium mb-1">اسم تعريفي للحساب</label>
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">اسم الحساب *</label>
               <input
                 value={label}
-                onChange={e => setLabel(e.target.value)}
-                onKeyDown={e => e.key === "Enter" && add()}
-                placeholder="مثل: الحساب الرئيسي"
-                className="w-full px-3 py-2 rounded-lg border border-slate-200 text-right text-sm focus:outline-none focus:ring-2 focus:ring-[#1B7A3D]"
-                autoFocus
+                onChange={(e) => setLabel(e.target.value)}
+                className="w-full px-3 py-2.5 rounded-lg border border-slate-200 text-right text-sm focus:outline-none focus:ring-2 focus:ring-[#1B7A3D]"
+                placeholder="مثال: حساب فيصل"
               />
             </div>
-            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-800">
-              ⏳ بعد الإنشاء، انتظر <strong>30-60 ثانية</strong> حتى يظهر رمز QR تلقائياً
+
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                Proxy (مُوصى به بشدة)
+              </label>
+              <input
+                value={proxy}
+                onChange={(e) => setProxy(e.target.value)}
+                dir="ltr"
+                className="w-full px-3 py-2.5 rounded-lg border border-slate-200 text-left text-sm focus:outline-none focus:ring-2 focus:ring-[#1B7A3D] font-mono"
+                placeholder="http://user:pass@host:port"
+              />
+              <p className="text-xs text-amber-700 mt-1.5 bg-amber-50 px-2 py-1.5 rounded">
+                ⚠ كل حساب يجب أن يمتلك Proxy residential مختلف.
+                بدون Proxy، الحساب سيُشارك IP الخادم مع بقية الحسابات وسيُحظر.
+              </p>
             </div>
-            <div className="flex gap-2 pt-1">
+
+            <div className="flex gap-3 pt-2">
               <button
                 onClick={() => setOpen(false)}
-                disabled={saving}
-                className="flex-1 px-4 py-2 rounded-lg border border-slate-200 text-sm hover:bg-slate-50 disabled:opacity-50"
+                className="flex-1 px-4 py-2.5 rounded-lg border border-slate-200 text-sm hover:bg-slate-50"
               >
                 إلغاء
               </button>
               <button
                 onClick={add}
                 disabled={saving}
-                className="flex-1 px-4 py-2 rounded-lg bg-[#1B7A3D] text-white text-sm font-medium hover:bg-[#145D2E] disabled:opacity-60 flex items-center justify-center gap-2"
+                className="flex-1 px-4 py-2.5 rounded-lg bg-[#1B7A3D] text-white text-sm font-medium hover:bg-[#145D2E] disabled:opacity-50 transition-colors"
               >
-                {saving ? <><Loader2 className="w-4 h-4 animate-spin" /> جاري الإنشاء...</> : "إنشاء وعرض QR"}
+                {saving ? "جاري الإنشاء..." : "إنشاء الحساب"}
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* QR Modal */}
+      {/* QR modal */}
       {qrOpen && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
-          onClick={() => setQrOpen(false)}
-        >
-          <div
-            className="bg-white rounded-2xl p-6 w-full max-w-sm mx-4 shadow-2xl"
-            dir="rtl"
-            onClick={e => e.stopPropagation()}
-          >
-            <h2 className="text-xl font-bold mb-1 text-center">امسح رمز QR</h2>
-            <p className="text-sm text-slate-500 text-center mb-5">
-              من تطبيق واتساب ← الإعدادات ← الأجهزة المرتبطة
-            </p>
+        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4" onClick={() => setQrOpen(false)}>
+          <div className="bg-white rounded-2xl p-6 w-full max-w-sm text-center space-y-4 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-xl font-bold">مسح رمز QR</h2>
 
-            <div className="flex flex-col items-center">
-              {!qrData?.qr ? (
-                <div className="w-64 h-64 flex flex-col items-center justify-center bg-slate-50 rounded-xl border-2 border-dashed border-slate-200 gap-4">
-                  <Loader2 className="w-10 h-10 animate-spin text-[#1B7A3D]" />
-                  <div className="text-center">
-                    <p className="text-sm font-medium text-slate-700">جاري تهيئة المتصفح...</p>
-                    <p className="text-xs text-slate-400 mt-1">
-                      {initSec}ث مضت — المتوقع ~{estimatedTotal}ث
-                    </p>
-                  </div>
-                  {/* Progress bar */}
-                  <div className="w-48 h-1.5 bg-slate-200 rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-[#1B7A3D] rounded-full transition-all duration-1000"
-                      style={{ width: `${pct}%` }}
-                    />
-                  </div>
-                </div>
-              ) : (
-                <div className="relative">
-                  <img
-                    src={qrData.qr}
-                    alt="QR Code"
-                    className="w-64 h-64 border-4 border-[#1B7A3D] rounded-xl"
-                  />
-                  <div className="absolute -top-2 -right-2 bg-green-500 text-white text-xs px-2 py-0.5 rounded-full font-medium">
-                    جاهز للمسح
-                  </div>
-                </div>
-              )}
+            {(!qrData || qrData.status === "initializing") && (
+              <div className="py-10 space-y-3">
+                <Loader2 className="w-12 h-12 text-[#1B7A3D] animate-spin mx-auto" />
+                <p className="text-sm text-slate-500">جاري تهيئة Puppeteer + Stealth...</p>
+                <p className="text-xs text-slate-400">{initSec}s — قد يستغرق 30–60 ثانية</p>
+              </div>
+            )}
 
-              <div className="mt-5 w-full space-y-2 text-sm text-slate-600">
-                <div className="flex items-center gap-2">
-                  <span className="w-5 h-5 rounded-full bg-[#1B7A3D] text-white text-xs flex items-center justify-center font-bold shrink-0">١</span>
-                  افتح واتساب على هاتفك
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="w-5 h-5 rounded-full bg-[#1B7A3D] text-white text-xs flex items-center justify-center font-bold shrink-0">٢</span>
-                  الإعدادات → الأجهزة المرتبطة
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="w-5 h-5 rounded-full bg-[#1B7A3D] text-white text-xs flex items-center justify-center font-bold shrink-0">٣</span>
-                  اضغط "ربط جهاز" وامسح الرمز
+            {qrData?.status === "qr" && qrData.qr && (
+              <div className="space-y-3">
+                <img src={qrData.qr} alt="QR" className="w-56 h-56 mx-auto rounded-lg border border-slate-200" />
+                <p className="text-sm text-slate-600">
+                  افتح واتساب ← الأجهزة المرتبطة ← ربط جهاز ← امسح الرمز
+                </p>
+                <div className="flex items-center justify-center gap-1.5 text-xs text-blue-600">
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  تحديث تلقائي...
                 </div>
               </div>
-            </div>
+            )}
+
+            {qrData?.status === "connected" && (
+              <div className="py-6 space-y-2">
+                <CheckCircle2 className="w-16 h-16 text-emerald-500 mx-auto" />
+                <p className="font-semibold text-emerald-700">تم الربط بنجاح!</p>
+              </div>
+            )}
+
+            {qrData?.status === "error" && (
+              <div className="py-6 space-y-2">
+                <AlertCircle className="w-12 h-12 text-red-500 mx-auto" />
+                <p className="text-sm text-red-600">فشل في التهيئة. تحقق من إعداد Chromium.</p>
+              </div>
+            )}
 
             <button
               onClick={() => setQrOpen(false)}
-              className="mt-5 w-full px-4 py-2 rounded-lg border border-slate-200 text-sm text-slate-600 hover:bg-slate-50"
+              className="w-full px-4 py-2.5 rounded-lg border border-slate-200 text-sm hover:bg-slate-50"
             >
-              إغلاق (الحساب سيظل قيد التهيئة)
+              إغلاق
             </button>
           </div>
         </div>

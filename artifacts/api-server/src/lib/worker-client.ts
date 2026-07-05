@@ -1,7 +1,7 @@
 import { logger } from "./logger";
 
 const WORKER_URL = process.env.WORKER_URL ?? "http://localhost:8088";
-const TIMEOUT_MS = 10_000;
+const TIMEOUT_MS = 15_000;
 
 async function workerFetch(
   path: string,
@@ -20,8 +20,22 @@ async function workerFetch(
   }
 }
 
-export async function workerCreateSession(sessionId: string): Promise<void> {
-  await workerFetch(`/sessions/${sessionId}`, { method: "POST" });
+/**
+ * Create a new WhatsApp session in the worker.
+ * @param sessionId  - account UUID used as session ID
+ * @param proxy      - optional per-account proxy, e.g. "http://user:pass@host:port"
+ *                     Every account should ideally have its own residential proxy
+ *                     to avoid WhatsApp detecting multiple sessions from the same IP.
+ */
+export async function workerCreateSession(
+  sessionId: string,
+  proxy?: string | null,
+): Promise<void> {
+  await workerFetch(`/sessions/${sessionId}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ accountId: sessionId, proxy: proxy ?? null }),
+  });
 }
 
 export async function workerDeleteSession(sessionId: string): Promise<void> {
@@ -31,14 +45,12 @@ export async function workerDeleteSession(sessionId: string): Promise<void> {
 }
 
 export interface SessionStatus {
-  status: "initializing" | "qr" | "connected" | "disconnected" | "logged_out";
-  qr?: string;
-  phone?: string;
+  status: "initializing" | "qr" | "connected" | "disconnected" | "logged_out" | "error";
+  qr?: string | null;
+  phone?: string | null;
 }
 
-export async function workerGetSession(
-  sessionId: string,
-): Promise<SessionStatus> {
+export async function workerGetSession(sessionId: string): Promise<SessionStatus> {
   try {
     const res = await workerFetch(`/sessions/${sessionId}`);
     if (!res.ok) return { status: "disconnected" };
@@ -71,15 +83,10 @@ export async function workerSendMessage(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sessionId, phone, text }),
     });
-    if (!res.ok) {
-      const body = (await res.json().catch(() => ({}))) as { error?: string };
-      return { ok: false, error: body.error ?? `HTTP ${res.status}` };
-    }
-    return { ok: true };
-  } catch (err: unknown) {
-    return {
-      ok: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    if (res.ok) return { ok: true };
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    return { ok: false, error: body.error ?? `HTTP ${res.status}` };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
   }
 }
