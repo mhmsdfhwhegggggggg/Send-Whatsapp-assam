@@ -1,3 +1,3 @@
-- [API Server PORT issue](api-server-port.md) — workflow لا يمرر PORT تلقائياً للـ dev script، يجب تضمينه صريحاً في أمر الـ workflow
-- [Baileys blocked](whatsapp-lib.md) — @whiskeysockets/baileys محظورة في Replit، البديل whatsapp-web.js
-- [Workflow kill pattern](workflow-kill.md) — عند restart الـ workflow، يجب قتل العملية القديمة أولاً
+- [Anti-ban architecture](anti-ban.md) — puppeteer-extra stealth via wsEndpoint is the correct approach; "none" webVersionCache is a fingerprint
+- [Worker security](worker-security.md) — WA Worker requires WORKER_SECRET env var; all endpoints except /healthz gated
+- [Campaign runner tiering](campaign-runner-tiering.md) — tiered limits (new/warm/hot) based on account age + totalReplies; kill switch checked per-message not per-batch
