@@ -102,20 +102,37 @@ function isSuspended(acc: AccRow): boolean {
   return new Date(acc.suspendedUntil) > new Date();
 }
 
-// ── Account health score (persistent) ─────────────────────────────────────
-// Now uses the DB-backed healthScore column. In-memory map used only as
-// session cache to avoid excessive DB reads per message.
+// ── Account health score (persistent + cache) ─────────────────────────────
+// Source of truth: accountsTable.healthScore (persisted in DB).
+// In-memory cache used only to reduce DB reads per message.
+// CRITICAL: cache is ALWAYS seeded from DB on first access — never defaults
+// to 100. This ensures degraded accounts stay degraded across server restarts.
 const sessionHealthCache = new Map<string, number>();
 
-function getCachedHealth(accountId: string, dbScore: number): number {
-  return sessionHealthCache.get(accountId) ?? dbScore;
+/**
+ * Hydrate cache from DB for an account if not already cached.
+ * Must be called before any health read/write for correctness after restart.
+ */
+async function hydrateHealthCache(accountId: string): Promise<number> {
+  if (sessionHealthCache.has(accountId)) return sessionHealthCache.get(accountId)!;
+  const [acc] = await db.select({ healthScore: accountsTable.healthScore })
+    .from(accountsTable).where(eq(accountsTable.id, accountId));
+  const score = acc?.healthScore ?? 100;
+  sessionHealthCache.set(accountId, score);
+  return score;
+}
+
+function getCachedHealth(accountId: string): number {
+  // Cache must already be hydrated (via hydrateHealthCache) before calling this.
+  return sessionHealthCache.get(accountId) ?? 100;
 }
 
 async function recordSuccess(accountId: string, settings: SettingsRow): Promise<void> {
-  const current = sessionHealthCache.get(accountId) ?? 100;
+  // Ensure we start from the real persisted score, not 100
+  const current  = await hydrateHealthCache(accountId);
   const newScore = Math.min(100, current + 0.5);
   sessionHealthCache.set(accountId, newScore);
-  // Persist every 10 successes to reduce DB writes
+  // Persist every ~10 successes to reduce DB writes
   if (Math.random() < 0.1) {
     await updateHealthScore(accountId, +0.5, settings);
     await logAccountEvent(accountId, "send_ok");
@@ -123,14 +140,14 @@ async function recordSuccess(accountId: string, settings: SettingsRow): Promise<
 }
 
 async function recordFailure(accountId: string, settings: SettingsRow, error?: string): Promise<void> {
-  const current = sessionHealthCache.get(accountId) ?? 100;
-  // Build a rolling window metric from the cached score
+  // Ensure we start from the real persisted score, not 100
+  const current  = await hydrateHealthCache(accountId);
   const failRate = 1 - (current / 100);
   const delta    = failRate > 0.3 ? -10 : -3;
   const newScore = Math.max(0, current + delta);
   sessionHealthCache.set(accountId, newScore);
 
-  // Always persist failures immediately (they're high-signal events)
+  // Always persist failures immediately (high-signal events)
   await updateHealthScore(accountId, delta, settings);
   await logAccountEvent(accountId, "send_fail", error);
 
@@ -139,8 +156,10 @@ async function recordFailure(accountId: string, settings: SettingsRow, error?: s
   }, "account health degraded");
 }
 
-function isHealthy(accountId: string, dbScore: number, threshold: number): boolean {
-  return getCachedHealth(accountId, dbScore) >= threshold;
+async function isHealthy(accountId: string, dbScore: number, threshold: number): Promise<boolean> {
+  // Hydrate from DB score on cache miss — never assume 100
+  if (!sessionHealthCache.has(accountId)) sessionHealthCache.set(accountId, dbScore);
+  return getCachedHealth(accountId) >= threshold;
 }
 
 // ── Daily reset ────────────────────────────────────────────────────────────
@@ -169,7 +188,7 @@ async function pickAccount(accountIds: string[], settings: SettingsRow): Promise
       continue;
     }
     const dbScore = acc.healthScore ?? 100;
-    if (!isHealthy(acc.id, dbScore, settings.healthScoreThreshold)) {
+    if (!(await isHealthy(acc.id, dbScore, settings.healthScoreThreshold))) {
       logger.warn({ accountId: acc.id, score: dbScore }, "skipped: low health score");
       continue;
     }
@@ -411,7 +430,7 @@ async function _run(campaignId: string): Promise<void> {
         batchCount++;
         logger.info({
           campaignId, phone, accountId,
-          health: getCachedHealth(accountId, 100),
+          health: getCachedHealth(accountId),
           spamScore: spamScore.score,
         }, "sent ✓");
       } else {
