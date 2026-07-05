@@ -4,12 +4,10 @@ import {
   messagesTable,
   accountsTable,
   settingsTable,
-  studentsTable,
-  groupsTable,
   templatesTable,
   optOutTable,
 } from "@workspace/db/schema";
-import { eq, inArray, and, notInArray } from "drizzle-orm";
+import { eq, inArray, and } from "drizzle-orm";
 import {
   applySpintax,
   fillVars,
@@ -38,6 +36,11 @@ function todayStr(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+/** Normalize phone to pure digits for consistent matching */
+function normalizePhone(raw: string): string {
+  return raw.replace(/[\s\-\+\(\)]/g, "");
+}
+
 /* ── Settings loader ─────────────────────────────────────────────────── */
 async function getSettings() {
   const rows = await db.select().from(settingsTable).where(eq(settingsTable.id, 1));
@@ -60,10 +63,10 @@ async function getSettings() {
   };
 }
 
-/* ── Tiered daily limit per account ────────────────────────────────────
- *  NEW  (< warmUpDaysThreshold days) → newAccountDailyLimit  (default 20)
- *  WARM (≥ warmUpDaysThreshold days) → warmAccountDailyLimit (default 80)
- *  HOT  (≥ hotDaysThreshold days AND ≥ hotReplyThreshold replies) → hotAccountDailyLimit (150)
+/* ── Tiered daily limit per account ──────────────────────────────────────
+ *  NEW  (< warmUpDaysThreshold days)                 → newAccountDailyLimit  (default 20)
+ *  WARM (≥ warmUpDaysThreshold days)                 → warmAccountDailyLimit (default 80)
+ *  HOT  (≥ hotDaysThreshold days + hotReplyThreshold replies) → hotAccountDailyLimit (150)
  * ─────────────────────────────────────────────────────────────────────── */
 function getDailyLimit(
   acc: { warmUpDay: number; totalReplies: number; createdAt: Date },
@@ -177,7 +180,6 @@ async function _runCampaign(campaignId: string): Promise<void> {
     return;
   }
 
-  const settings = await getSettings();
   const accountIds = JSON.parse(campaign.accountIds) as string[];
   let batchCount = 0;
 
@@ -187,16 +189,18 @@ async function _runCampaign(campaignId: string): Promise<void> {
   }
 
   while (true) {
-    // ── Reload campaign and settings each iteration ──
+    // ── Reload fresh campaign state ──
     const [fresh] = await db
       .select()
       .from(campaignsTable)
       .where(eq(campaignsTable.id, campaignId));
     if (!fresh || fresh.status !== "running") break;
 
-    // ── Kill switch check ──
-    const freshSettings = await getSettings();
-    if (freshSettings.killSwitch) {
+    // ── Reload settings (picks up live changes + kill switch) ──
+    const settings = await getSettings();
+
+    // ── Kill switch: checked per-iteration ──
+    if (settings.killSwitch) {
       logger.warn({ campaignId }, "kill switch active — pausing campaign");
       await db
         .update(campaignsTable)
@@ -206,15 +210,15 @@ async function _runCampaign(campaignId: string): Promise<void> {
     }
 
     // ── Working hours check ──
-    if (!isWorkingHour(freshSettings.workingHoursStart, freshSettings.workingHoursEnd)) {
+    if (!isWorkingHour(settings.workingHoursStart, settings.workingHoursEnd)) {
       logger.info({ campaignId }, "outside working hours — sleeping 5min");
       await sleep(5 * 60 * 1000);
       continue;
     }
 
-    // ── Load opt-out phones ──
+    // ── Load opt-out phones (normalized) ──
     const optOutRows = await db.select({ phone: optOutTable.phone }).from(optOutTable);
-    const optOutPhones = new Set(optOutRows.map((r) => r.phone));
+    const optOutPhones = new Set(optOutRows.map((r) => normalizePhone(r.phone)));
 
     // ── Fetch next pending batch ──
     const pending = await db
@@ -229,7 +233,6 @@ async function _runCampaign(campaignId: string): Promise<void> {
       .limit(fresh.batchSize);
 
     if (pending.length === 0) {
-      // All messages processed — mark complete
       await db
         .update(campaignsTable)
         .set({ status: "completed" })
@@ -239,14 +242,25 @@ async function _runCampaign(campaignId: string): Promise<void> {
     }
 
     for (const msg of pending) {
-      // Re-check campaign status before each message
+      // ── Per-message: reload campaign status ──
       const [chk] = await db
         .select()
         .from(campaignsTable)
         .where(eq(campaignsTable.id, campaignId));
       if (!chk || chk.status !== "running") return;
 
-      // ── Skip opt-out numbers ──
+      // ── Per-message: kill switch check (catches mid-batch toggles) ──
+      const perMsgSettings = await getSettings();
+      if (perMsgSettings.killSwitch) {
+        logger.warn({ campaignId }, "kill switch — stopping mid-batch");
+        await db
+          .update(campaignsTable)
+          .set({ status: "paused" })
+          .where(eq(campaignsTable.id, campaignId));
+        return;
+      }
+
+      // ── Sanitize + normalize phone ──
       let phone: string;
       try {
         phone = sanitizePhone(msg.phone);
@@ -258,16 +272,18 @@ async function _runCampaign(campaignId: string): Promise<void> {
         continue;
       }
 
-      if (optOutPhones.has(phone)) {
+      // ── Skip opt-out numbers (normalized comparison) ──
+      if (optOutPhones.has(normalizePhone(phone))) {
         await db
           .update(messagesTable)
           .set({ status: "failed", error: "opt_out" })
           .where(eq(messagesTable.id, msg.id));
+        logger.info({ campaignId, phone }, "skipped: opt-out");
         continue;
       }
 
       // ── Pick available account ──
-      const accountId = await pickAccount(accountIds, freshSettings);
+      const accountId = await pickAccount(accountIds, perMsgSettings);
       if (!accountId) {
         logger.warn({ campaignId }, "no account available — sleeping 5min");
         await sleep(5 * 60 * 1000);
@@ -276,16 +292,16 @@ async function _runCampaign(campaignId: string): Promise<void> {
 
       // ── Build message text ──
       let text = template.body;
-      if (freshSettings.spintaxEnabled) text = applySpintax(text);
+      if (perMsgSettings.spintaxEnabled) text = applySpintax(text);
       text = fillVars(text, {
         name:        msg.studentName,
         university:  undefined,
         discount:    undefined,
         serviceType: undefined,
       });
-      if (freshSettings.invisibleCharsEnabled) text = addInvisibleChars(text);
+      if (perMsgSettings.invisibleCharsEnabled) text = addInvisibleChars(text);
 
-      // ── Update message body and send ──
+      // ── Persist body + accountId, then send ──
       await db
         .update(messagesTable)
         .set({ body: text, accountId })
@@ -300,10 +316,10 @@ async function _runCampaign(campaignId: string): Promise<void> {
           .where(eq(messagesTable.id, msg.id));
         await incrementSentToday(accountId);
         batchCount++;
-        logger.info({ campaignId, phone, accountId }, "message sent");
+        logger.info({ campaignId, phone, accountId }, "message sent ✓");
       } else {
         const retries = msg.retryCount + 1;
-        if (retries >= freshSettings.maxRetries) {
+        if (retries >= perMsgSettings.maxRetries) {
           await db
             .update(messagesTable)
             .set({ status: "failed", error: result.error, retryCount: retries })
@@ -315,7 +331,7 @@ async function _runCampaign(campaignId: string): Promise<void> {
             .set({ retryCount: retries, error: result.error })
             .where(eq(messagesTable.id, msg.id));
           logger.warn({ campaignId, msgId: msg.id, retries }, "will retry");
-          await sleep(freshSettings.retryDelayMin * 60 * 1000);
+          await sleep(perMsgSettings.retryDelayMin * 60 * 1000);
           continue;
         }
       }

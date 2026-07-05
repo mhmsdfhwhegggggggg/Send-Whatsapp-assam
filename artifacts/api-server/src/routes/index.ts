@@ -8,6 +8,7 @@ import accountsRouter from "./accounts";
 import campaignsRouter from "./campaigns";
 import settingsRouter from "./settings";
 import statsRouter from "./stats";
+import extraRouter from "./extra";
 
 const router: IRouter = Router();
 
@@ -20,5 +21,7 @@ router.use(accountsRouter);
 router.use(campaignsRouter);
 router.use(settingsRouter);
 router.use(statsRouter);
+// Extra: kill-switch, inbound from WA Worker, opt-out management
+router.use(extraRouter);
 
 export default router;

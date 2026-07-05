@@ -3,11 +3,23 @@ import { mkdirSync, existsSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { execSync } from "child_process";
+import { createHmac, timingSafeEqual } from "crypto";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SESSIONS_DIR = path.join(__dirname, "..", "sessions");
 const PORT = parseInt(process.env.WA_WORKER_PORT ?? "8088", 10);
 const API_SERVER_URL = process.env.API_SERVER_URL ?? "http://localhost:8080";
+
+/**
+ * WORKER_SECRET: shared secret between API server and WA worker.
+ * All incoming requests to the worker MUST present this in the
+ * X-Worker-Secret header. Set the same value in both services.
+ * If not set, the worker falls back to logging a warning (dev mode only).
+ */
+const WORKER_SECRET = process.env.WORKER_SECRET ?? null;
+if (!WORKER_SECRET) {
+  log("warn", "WORKER_SECRET not set — worker is open to any caller on the network. Set this in production.");
+}
 
 if (!existsSync(SESSIONS_DIR)) mkdirSync(SESSIONS_DIR, { recursive: true });
 
@@ -21,6 +33,21 @@ function sleep(ms) {
 
 function randomBetween(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+/* ── Shared-secret auth ─────────────────────────────────────────────── */
+function verifyWorkerSecret(req) {
+  if (!WORKER_SECRET) return true; // dev mode: allow all
+  const presented = req.headers["x-worker-secret"];
+  if (!presented) return false;
+  try {
+    return timingSafeEqual(
+      Buffer.from(presented, "utf8"),
+      Buffer.from(WORKER_SECRET, "utf8"),
+    );
+  } catch {
+    return false;
+  }
 }
 
 // ============================================================
@@ -70,17 +97,16 @@ function buildLaunchArgs(proxy) {
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
-    // Anti-detection: remove the most obvious bot fingerprints
+    // Anti-detection: removes the most obvious Puppeteer fingerprint
     "--disable-blink-features=AutomationControlled",
     "--disable-infobars",
     // Realistic window size
     "--window-size=1280,800",
-    // Language
+    // Language matching typical Arab phone
     "--lang=ar-SA,ar",
-    // Memory optimizations that don't raise red flags
+    // GPU/stability flags (no red flags)
     "--disable-gpu",
     "--disable-software-rasterizer",
-    // Stability
     "--disable-crash-reporter",
     "--no-first-run",
   ];
@@ -139,7 +165,7 @@ async function loadWWebJS() {
 
 // ============================================================
 // Session init queue — MAX 1 concurrent init
-// Prevents simultaneous Chromium launches from same IP
+// Prevents multiple Chromium instances launching simultaneously from same IP
 // Each init is separated by a 5–12s human-like gap
 // ============================================================
 let _initQueue = Promise.resolve();
@@ -152,7 +178,7 @@ function enqueueInit(fn) {
       return await fn();
     } finally {
       activeInits--;
-      // Always wait between inits — looks human, avoids rate-limiting
+      // Always wait between inits — looks human, avoids IP-level rate-limiting
       const gap = randomBetween(5000, 12000);
       log("info", `Init queue: waiting ${gap}ms before next session`);
       await sleep(gap);
@@ -173,9 +199,11 @@ async function forwardInbound(sessionId, phone, body) {
   try {
     const s = sessions.get(sessionId);
     const accountId = s?.accountId ?? sessionId;
+    const headers = { "Content-Type": "application/json" };
+    if (WORKER_SECRET) headers["X-Worker-Secret"] = WORKER_SECRET;
     const res = await fetch(`${API_SERVER_URL}/api/inbound`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ phone, body, accountId }),
     });
     if (!res.ok) log("warn", "inbound forward failed", { status: res.status });
@@ -202,7 +230,6 @@ async function createSession(sessionId, accountId = null, proxy = null) {
   };
   sessions.set(sessionId, state);
 
-  // Enqueue — never initialize two sessions at the same time
   enqueueInit(() => _doInit(state)).catch((e) => {
     log("error", "Session init failed", { sessionId, err: e.message });
     state.status = "error";
@@ -222,9 +249,8 @@ async function _doInit(state) {
   const pex = await loadPuppeteerExtra();
   let wsEndpoint = null;
 
-  // ── APPROACH A: launch stealth browser, pass WSEndpoint to wwejs ──
-  // This is the most effective anti-detection method: stealth patches are
-  // applied at the browser level BEFORE WhatsApp Web loads any JS.
+  // ── APPROACH: launch stealth browser, pass WSEndpoint to wwejs ──
+  // Stealth patches are applied at browser level BEFORE WhatsApp loads JS.
   if (pex) {
     try {
       const ua = randomUA();
@@ -237,24 +263,24 @@ async function _doInit(state) {
 
       const browser = await pex.launch(launchOpts);
 
-      // Patch all pages in this browser with realistic UA and hide automation
+      // Patch every page in this browser instance
       browser.on("targetcreated", async (target) => {
         try {
           const page = await target.page();
           if (!page) return;
           await page.setUserAgent(ua);
           await page.evaluateOnNewDocument(() => {
-            // Remove webdriver flag
+            // Remove webdriver flag — most important single check
             Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-            // Remove automation chrome properties
+            // Remove Puppeteer/CDP artifacts
             delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
             delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
             delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-            // Realistic plugin count
+            // Realistic plugin count (0 plugins = headless red flag)
             Object.defineProperty(navigator, "plugins", {
               get: () => [1, 2, 3, 4, 5],
             });
-            // Realistic language
+            // Realistic language matching our UA
             Object.defineProperty(navigator, "languages", {
               get: () => ["ar-SA", "ar", "en-US", "en"],
             });
@@ -271,15 +297,13 @@ async function _doInit(state) {
     }
   }
 
-  // ── Build Client options ──
   const clientOpts = {
     authStrategy: new LocalAuth({ clientId: sessionId, dataPath: SESSIONS_DIR }),
-    // Use LOCAL cache — not "none". Real browsers cache WA Web assets.
+    // LOCAL cache — real browsers cache WA Web assets; "none" is a fingerprint
     webVersionCache: { type: "local" },
   };
 
   if (wsEndpoint) {
-    // Connect wwejs to our already-stealthed browser
     clientOpts.puppeteer = { browserWSEndpoint: wsEndpoint };
   } else {
     // Fallback: wwejs launches its own browser with safe args
@@ -295,7 +319,6 @@ async function _doInit(state) {
   const client = new Client(clientOpts);
   state.client = client;
 
-  // ── Events ──
   client.on("qr", async (qr) => {
     try {
       state.qr = await QRCode.toDataURL(qr);
@@ -317,10 +340,8 @@ async function _doInit(state) {
     const info = client.info;
     state.phone = info?.wid?.user ?? null;
     log("info", "Session connected ✓", { sessionId, phone: state.phone });
-
-    // Human-like pause after connecting — simulates a person picking up their phone
+    // Human-like pause — simulates a person picking up the phone
     const humanPause = randomBetween(4000, 12000);
-    log("info", `Human pause after connect: ${humanPause}ms`, { sessionId });
     await sleep(humanPause);
   });
 
@@ -379,14 +400,14 @@ async function bodyJson(req) {
 }
 
 // ============================================================
-// HTTP Server
+// HTTP Server — every non-health endpoint requires WORKER_SECRET
 // ============================================================
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
   const parts = url.pathname.split("/").filter(Boolean);
 
   try {
-    // GET /healthz
+    // GET /healthz — no auth (monitoring/k8s probes)
     if (req.method === "GET" && parts[0] === "healthz") {
       respond(res, 200, {
         status: "ok",
@@ -394,6 +415,12 @@ const server = createServer(async (req, res) => {
         activeInits,
         chromium: CHROMIUM_PATH ?? "not found",
       });
+      return;
+    }
+
+    // All other endpoints require shared secret
+    if (!verifyWorkerSecret(req)) {
+      respond(res, 401, { error: "Unauthorized" });
       return;
     }
 
@@ -458,6 +485,5 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   log("info", "WhatsApp Worker listening", { port: PORT });
-  // Preload modules in background so first session starts faster
   Promise.all([loadWWebJS(), loadPuppeteerExtra()]).catch(() => {});
 });
