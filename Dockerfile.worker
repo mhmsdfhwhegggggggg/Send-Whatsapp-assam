@@ -1,0 +1,48 @@
+# ── Dockerfile.worker — WhatsApp Worker + Chromium ───────────────────────────
+# نستخدم node:20-slim (Debian) بدلاً من Alpine لأن Chromium يحتاج مكتبات Debian
+FROM node:20-slim
+
+# تثبيت Chromium وكل المكتبات المطلوبة
+RUN apt-get update && apt-get install -y \
+    chromium \
+    fonts-noto \
+    fonts-noto-cjk \
+    fonts-liberation \
+    fonts-freefont-ttf \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libxkbcommon0 \
+    libgbm1 \
+    libasound2 \
+    libxss1 \
+    libxtst6 \
+    xdg-utils \
+    wget \
+    ca-certificates \
+    --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
+# pnpm
+RUN npm install -g pnpm
+
+WORKDIR /app
+
+# نسخ ملفات الـ workspace
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml* ./
+COPY artifacts/wa-worker/  ./artifacts/wa-worker/
+COPY lib/                  ./lib/
+
+# تثبيت المكتبات
+RUN cd artifacts/wa-worker && pnpm install --frozen-lockfile 2>/dev/null || pnpm install
+
+# إنشاء مجلد sessions
+RUN mkdir -p /app/artifacts/wa-worker/sessions
+
+# متغيرات Chromium
+ENV CHROMIUM_PATH=/usr/bin/chromium
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+
+EXPOSE 8088
+
+CMD ["node", "artifacts/wa-worker/src/index.js"]

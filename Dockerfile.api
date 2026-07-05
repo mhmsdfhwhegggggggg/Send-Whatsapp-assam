@@ -1,0 +1,38 @@
+# ── Dockerfile.api — API Server ──────────────────────────────────────────────
+FROM node:20-alpine AS builder
+
+RUN npm install -g pnpm
+
+WORKDIR /app
+
+# نسخ ملفات الـ workspace أولاً (للـ cache)
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml* ./
+COPY lib/             ./lib/
+COPY artifacts/api-server/  ./artifacts/api-server/
+COPY artifacts/wa-worker/package.json  ./artifacts/wa-worker/package.json
+
+# تثبيت المكتبات
+RUN pnpm install --frozen-lockfile 2>/dev/null || pnpm install
+
+# بناء المشروع
+RUN pnpm --filter @workspace/api-server run build
+
+# ── Production image ──────────────────────────────────────────────────────────
+FROM node:20-alpine
+
+RUN npm install -g pnpm
+
+WORKDIR /app
+
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml* ./
+COPY lib/             ./lib/
+COPY artifacts/api-server/package.json  ./artifacts/api-server/
+COPY artifacts/wa-worker/package.json   ./artifacts/wa-worker/
+
+RUN pnpm install --prod --frozen-lockfile 2>/dev/null || pnpm install --prod
+
+# نسخ الـ build الجاهز
+COPY --from=builder /app/artifacts/api-server/dist ./artifacts/api-server/dist
+
+EXPOSE 8080
+CMD ["node", "--enable-source-maps", "./artifacts/api-server/dist/index.mjs"]

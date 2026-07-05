@@ -1,0 +1,127 @@
+version: "3.9"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AlMossah — Docker Compose (Production)
+#  تشغيل: docker compose up -d
+#  سجلات: docker compose logs -f
+# ══════════════════════════════════════════════════════════════════════════════
+
+services:
+
+  # ── قاعدة البيانات ──────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: almossah-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       almossah
+      POSTGRES_USER:     almossah
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD مطلوب في .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - almossah
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U almossah"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── API Server ─────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: almossah-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV:       production
+      DATABASE_URL:   postgres://almossah:${DB_PASSWORD}@postgres:5432/almossah
+      WORKER_SECRET:  ${WORKER_SECRET:?}
+      SESSION_SECRET: ${SESSION_SECRET:?}
+      SEND_TIMEZONE:  ${SEND_TIMEZONE:-Asia/Riyadh}
+      CORS_ORIGIN:    ${CORS_ORIGIN:-}
+      REQUIRE_PROXY:  ${REQUIRE_PROXY:-true}
+      PORT:           8080
+      API_SERVER_URL: http://api:8080
+      WA_WORKER_PORT: 8088
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      - almossah
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "3" }
+
+  # ── WhatsApp Worker ─────────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: almossah-worker
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      NODE_ENV:       production
+      WORKER_SECRET:  ${WORKER_SECRET}
+      API_SERVER_URL: http://api:8080
+      WA_WORKER_PORT: 8088
+      CHROMIUM_PATH:  /usr/bin/chromium
+    ports:
+      - "127.0.0.1:8088:8088"
+    volumes:
+      - wa_sessions:/app/artifacts/wa-worker/sessions
+    networks:
+      - almossah
+    # Chromium يحتاج صلاحيات خاصة
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=./chrome.json
+    shm_size: "1gb"
+    logging:
+      driver: json-file
+      options: { max-size: "100m", max-file: "5" }
+
+  # ── Nginx Reverse Proxy ─────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: almossah-nginx
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/almossah.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./artifacts/frontend/dist/public:/usr/share/nginx/html:ro
+      - certbot_www:/var/www/certbot:ro
+      - certbot_conf:/etc/letsencrypt:ro
+    networks:
+      - almossah
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "3" }
+
+# ── Volumes ──────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+  wa_sessions:
+  certbot_www:
+  certbot_conf:
+
+# ── Network ──────────────────────────────────────────────────────────────
+networks:
+  almossah:
+    driver: bridge
