@@ -1,16 +1,16 @@
 /**
- * wa-worker/src/index.js  — WhatsApp Worker  (maximum anti-ban edition)
+ * wa-worker/src/index.js  — WhatsApp Worker  (maximum anti-ban edition v3)
  *
- * Anti-ban layers applied here:
- *   1. puppeteer-extra + stealth plugin (removes webdriver, CDP artifacts, etc.)
- *   2. Full fingerprint stack via fingerprint.js (canvas, WebGL, audio, battery,
- *      WebRTC, media devices, screen, hardware concurrency …)
- *   3. Deterministic device profile per session (same account = same "phone")
- *   4. Local webVersionCache (real browsers cache WA Web assets)
- *   5. Session init queue — max 1 concurrent init, 5–12 s gap between inits
- *   6. Human send — typing indicator proportional to message length → hesitation → send
- *   7. Presence lifecycle — random online/offline cycles per session
+ * Anti-ban layers:
+ *   1. puppeteer-extra + stealth plugin
+ *   2. Full fingerprint stack (v3: noiseSeed حتمي من sessionId)
+ *   3. Deterministic device profile per session
+ *   4. Local webVersionCache
+ *   5. Session init queue — max 1 concurrent init, 5–12 s gap
+ *   6. Human send — multi-phase typing + hesitation
+ *   7. Presence lifecycle — random online/offline cycles
  *   8. Shared-secret authentication on all endpoints
+ *   9. [NEW v3] POST /presence — ضبط presence من campaign-runner
  */
 
 import { createServer }            from "http";
@@ -46,7 +46,11 @@ function verifySecret(req) {
   const h = req.headers["x-worker-secret"];
   if (!h) return false;
   try {
-    return timingSafeEqual(Buffer.from(h, "utf8"), Buffer.from(WORKER_SECRET, "utf8"));
+    // timingSafeEqual requires same-length buffers
+    const a = Buffer.from(h, "utf8");
+    const b = Buffer.from(WORKER_SECRET, "utf8");
+    if (a.length !== b.length) return false;
+    return timingSafeEqual(a, b);
   } catch { return false; }
 }
 
@@ -77,8 +81,15 @@ async function loadPuppeteerExtra() {
     log("info", "puppeteer-extra + stealth ✓");
     return pex;
   } catch (e) {
-    log("warn", "puppeteer-extra unavailable, trying bare puppeteer", { err: e.message });
-    try { _pex = (await import("puppeteer")).default; return _pex; } catch { return null; }
+    log("warn", "puppeteer-extra unavailable, falling back to bare puppeteer", { err: e.message });
+    try {
+      _pex = (await import("puppeteer")).default;
+      log("warn", "CAUTION: running without stealth — sessions may be detected as bots");
+      return _pex;
+    } catch {
+      log("error", "Neither puppeteer-extra nor puppeteer available");
+      return null;
+    }
   }
 }
 
@@ -150,7 +161,6 @@ async function createSession(sessionId, accountId = null, proxy = null) {
 async function _doInit(state) {
   const { id: sessionId, proxy } = state;
 
-  // Pick deterministic device profile for this account
   const profile = pickProfile(sessionId);
   log("info", "device profile selected", { sessionId, ua: profile.ua.slice(0, 60) });
 
@@ -176,7 +186,6 @@ async function _doInit(state) {
         "--disable-software-rasterizer",
         "--disable-crash-reporter",
         "--no-first-run",
-        // Ensure timezone matches proxy location
         `--tz=${profile.timezone}`,
       ];
       if (proxy) launchArgs.push(`--proxy-server=${proxy}`);
@@ -190,23 +199,19 @@ async function _doInit(state) {
 
       const browser = await pex.launch(launchOpts);
 
-      // Build the full fingerprint script once (seed is per-init)
-      const fpScript = buildFingerprintScript(profile);
+      // إصلاح v3: نمرر sessionId إلى buildFingerprintScript لضمان noiseSeed حتمي
+      const fpScript = buildFingerprintScript(profile, sessionId);
 
-      // Inject fingerprint into every new page/tab
       browser.on("targetcreated", async target => {
         try {
           const page = await target.page();
           if (!page) return;
-          // UA override at HTTP level
           await page.setUserAgent(profile.ua);
-          // Full fingerprint stack at JS level
           await page.evaluateOnNewDocument(fpScript);
-          // Extra: set viewport to match profile
           await page.setViewport({
             width: profile.screen.width,
             height: profile.screen.height,
-            deviceScaleFactor: 2.625,
+            deviceScaleFactor: profile.dpr ?? 2.625,
             isMobile: true,
             hasTouch: true,
           }).catch(() => {});
@@ -225,7 +230,7 @@ async function _doInit(state) {
   // ── Build wwejs client ─────────────────────────────────────────────────
   const clientOpts = {
     authStrategy: new LocalAuth({ clientId: sessionId, dataPath: SESSIONS_DIR }),
-    webVersionCache: { type: "local" },   // Real browsers cache WA Web assets
+    webVersionCache: { type: "local" },
   };
 
   if (wsEndpoint) {
@@ -259,12 +264,14 @@ async function _doInit(state) {
     // Human pause after connecting (4–12 s)
     await new Promise(r => setTimeout(r, 4000 + Math.random() * 8000));
 
-    // Start presence lifecycle
     state.presenceCycle = startPresenceCycle(client, sessionId, log);
   });
 
-  client.on("auth_failure", msg => { state.status = "logged_out"; log("error", "auth failure", { sessionId, msg }); });
-  client.on("disconnected",  reason => {
+  client.on("auth_failure", msg => {
+    state.status = "logged_out";
+    log("error", "auth failure", { sessionId, msg });
+  });
+  client.on("disconnected", reason => {
     state.status = "disconnected";
     state.presenceCycle?.stop();
     log("warn", "disconnected", { sessionId, reason });
@@ -312,7 +319,7 @@ const server = createServer(async (req, res) => {
   const parts = url.pathname.split("/").filter(Boolean);
 
   try {
-    // GET /healthz — no auth (k8s probes, monitoring)
+    // GET /healthz — no auth (probes)
     if (req.method === "GET" && parts[0] === "healthz") {
       respond(res, 200, {
         ok: true, sessions: sessions.size, activeInits,
@@ -370,7 +377,6 @@ const server = createServer(async (req, res) => {
       const chatId = phone.includes("@") ? phone : `${phone}@c.us`;
 
       if (humanMode) {
-        // Full human simulation: typing → hesitation → send
         await humanSend(s.client, chatId, text);
       } else {
         await s.client.sendMessage(chatId, text);
@@ -379,30 +385,50 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-
     // POST /check-phone  { sessionId, phone }
-    // Verify if a phone number is registered on WhatsApp BEFORE sending.
-    // This is a critical anti-ban measure: sending to non-WA numbers raises
-    // the error rate and triggers WhatsApp spam detection faster.
-    // Returns { registered: bool } — fail-open on any error.
-    if (req.method === 'POST' && parts[0] === 'check-phone') {
+    if (req.method === "POST" && parts[0] === "check-phone") {
       const body = await readBody(req);
       const { sessionId, phone } = body;
       if (!sessionId || !phone) {
-        respond(res, 400, { error: 'sessionId, phone required' }); return;
+        respond(res, 400, { error: "sessionId, phone required" }); return;
       }
       const s = sessions.get(sessionId);
-      if (!s || s.status !== 'connected' || !s.client) {
-        // Fail open: session not ready → don't block campaign
-        respond(res, 200, { registered: true, reason: 'session_not_connected' }); return;
+      if (!s || s.status !== "connected" || !s.client) {
+        respond(res, 200, { registered: true, reason: "session_not_connected" }); return;
       }
       try {
-        const chatId = phone.includes('@') ? phone : `${phone}@c.us`;
+        const chatId = phone.includes("@") ? phone : `${phone}@c.us`;
         const contact = await s.client.getNumberId(chatId);
         respond(res, 200, { registered: !!contact });
       } catch (e) {
-        log('warn', 'check-phone error', { phone, err: e.message });
-        respond(res, 200, { registered: true, reason: 'check_error' });
+        log("warn", "check-phone error", { phone, err: e.message });
+        respond(res, 200, { registered: true, reason: "check_error" });
+      }
+      return;
+    }
+
+    // POST /presence  { sessionId, available: boolean }
+    // [جديد v3] يُستدعى من campaign-runner لضبط الـ presence فعلياً
+    if (req.method === "POST" && parts[0] === "presence") {
+      const body = await readBody(req);
+      const { sessionId, available } = body;
+      if (!sessionId || available === undefined) {
+        respond(res, 400, { error: "sessionId, available required" }); return;
+      }
+      const s = sessions.get(sessionId);
+      if (!s || s.status !== "connected" || !s.client) {
+        respond(res, 200, { ok: true, skipped: true, reason: "session_not_connected" }); return;
+      }
+      try {
+        if (available) {
+          await s.client.sendPresenceAvailable?.();
+        } else {
+          await s.client.sendPresenceUnavailable?.();
+        }
+        respond(res, 200, { ok: true, available });
+      } catch (e) {
+        log("warn", "presence set error", { sessionId, err: e.message });
+        respond(res, 200, { ok: true, skipped: true, reason: "presence_error" });
       }
       return;
     }
@@ -416,6 +442,5 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   log("info", "WA Worker listening", { port: PORT });
-  // Preload heavy modules in background
   Promise.all([loadWWebJS(), loadPuppeteerExtra()]).catch(() => {});
 });

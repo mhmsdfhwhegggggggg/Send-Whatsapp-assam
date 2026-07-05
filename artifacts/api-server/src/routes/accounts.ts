@@ -14,6 +14,10 @@ import { getDailyLimitForAccount } from "../lib/warm-up";
 const router = Router();
 router.use(requireAuth);
 
+// في production: يجب أن يكون لكل حساب proxy
+// اضبط REQUIRE_PROXY=true في الأسرار لتفعيل الإجبار
+const REQUIRE_PROXY = process.env.REQUIRE_PROXY === "true";
+
 /* ── Session status cache (5s TTL) ─────────────────────────────────── */
 let sessionCache: Record<string, { status: string; qr?: string; phone?: string; ts: number }> = {};
 const CACHE_TTL = 5_000;
@@ -55,8 +59,7 @@ router.get("/accounts", async (_req, res) => {
 
     return {
       ...a,
-      proxy: a.proxy ?? null,
-      // Mask proxy credentials before sending to frontend
+      proxy: undefined,                          // لا ترسل الـ proxy الكاملة للواجهة
       proxyMasked: a.proxy
         ? a.proxy.replace(/\/\/([^:]+):([^@]+)@/, "//***:***@")
         : null,
@@ -82,33 +85,47 @@ router.post("/accounts", async (req, res) => {
     return;
   }
 
-  // Proxy is strongly recommended — warn but don't block if omitted.
-  // In production, every account MUST have its own residential proxy
-  // (different IP per account) to avoid multi-account detection.
-  // Format: http://user:pass@host:port
-  const proxyWarning = !proxy?.trim()
-    ? "⚠️ لم يتم تقديم proxy. يُوصى بشدة باستخدام proxy سكني مستقل لكل حساب لتجنب الحظر."
-    : null;
+  const proxyTrimmed = proxy?.trim() || null;
 
-  if (proxy?.trim()) {
-    // Basic proxy URL validation
+  // إصلاح: في production يُجبر على proxy
+  if (REQUIRE_PROXY && !proxyTrimmed) {
+    res.status(400).json({
+      error: "proxy مطلوب في وضع الإنتاج. يجب لكل حساب proxy سكني مستقل.",
+      hint: "صيغة: http://user:pass@host:port",
+    });
+    return;
+  }
+
+  // التحقق من صيغة الـ proxy
+  if (proxyTrimmed) {
     try {
-      const url = new URL(proxy.trim());
+      const url = new URL(proxyTrimmed);
       if (!["http:", "https:", "socks5:"].includes(url.protocol)) {
         res.status(400).json({ error: "Proxy يجب أن يكون بصيغة http://user:pass@host:port" });
         return;
       }
+      // تحقق من وجود credentials (مطلوبة للـ residential proxies)
+      if (!url.username || !url.password) {
+        res.status(400).json({
+          error: "يجب أن يحتوي الـ proxy على اسم مستخدم وكلمة مرور: http://user:pass@host:port",
+        });
+        return;
+      }
     } catch {
-      res.status(400).json({ error: "صيغة Proxy غير صحيحة. يجب أن تكون: http://user:pass@host:port" });
+      res.status(400).json({ error: "صيغة Proxy غير صحيحة. يجب: http://user:pass@host:port" });
       return;
     }
   }
+
+  const proxyWarning = !proxyTrimmed
+    ? "⚠️ لم يتم تقديم proxy. يُوصى بشدة باستخدام proxy سكني مستقل لكل حساب لتجنب الحظر الجماعي."
+    : null;
 
   const [acc] = await db
     .insert(accountsTable)
     .values({
       label: label.trim(),
-      proxy: proxy?.trim() || null,
+      proxy: proxyTrimmed,
     })
     .returning();
 
@@ -119,7 +136,10 @@ router.post("/accounts", async (req, res) => {
   }
 
   sessionCache = {};
-  res.status(201).json({ ...acc, warning: proxyWarning });
+
+  // لا نُعيد الـ proxy في الاستجابة (أمان)
+  const { proxy: _omit, ...safeAcc } = acc;
+  res.status(201).json({ ...safeAcc, hasProxy: !!acc.proxy, warning: proxyWarning });
 });
 
 /* ── GET /accounts/:id/qr ───────────────────────────────────────────── */
@@ -163,11 +183,10 @@ router.delete("/accounts/:id", async (req, res) => {
 });
 
 /* ── POST /accounts/:id/unsuspend ───────────────────────────────────── */
-// Manually clear a suspension (admin override)
 router.post("/accounts/:id/unsuspend", async (req, res) => {
   const rows = await db
     .update(accountsTable)
-    .set({ suspendedUntil: null, healthScore: 60 }) // Restore to 60 (still degraded but usable)
+    .set({ suspendedUntil: null, healthScore: 60 })
     .where(eq(accountsTable.id, req.params.id))
     .returning();
 

@@ -1,16 +1,12 @@
 /**
- * fingerprint.js
+ * fingerprint.js — PRODUCTION HARDENED v3
  *
- * Full browser fingerprint spoofing stack — PRODUCTION HARDENED v2
- * Call buildFingerprintScript(profile) to get a string passed to
- * page.evaluateOnNewDocument() — runs BEFORE any page JS loads.
+ * إصلاحات v3:
+ *   - noiseSeed حتمي مبني على sessionId (كان عشوائياً كل restart → بصمة متغيرة = بوت واضح)
+ *   - حالة الشحن (charging) ثابتة per-session (كانت عشوائية مع كل page load)
+ *   - buildFingerprintScript(profile, sessionId) — يستقبل sessionId الآن
  *
- * FIX v2: All device profiles now use Chrome/138.0.0.0 to match the
- * actual Chromium binary (138.0.7204.100) installed in the environment.
- * A mismatch between real browser capabilities and spoofed UA version
- * is one of the most detectable bot signals.
- *
- * Covers every vector WhatsApp Web is known to probe:
+ * يغطي كل ناقل تفتيشه WhatsApp Web:
  *   canvas noise, WebGL vendor/renderer, Audio context, Screen geometry,
  *   hardware concurrency, device memory, battery, network info, WebRTC,
  *   media devices, permissions, speech synthesis, timezone, fonts,
@@ -18,8 +14,8 @@
  */
 
 // ── Device profiles ────────────────────────────────────────────────────────
-// CRITICAL: All UA strings must match the ACTUAL installed Chromium version.
-// Current env: chromium-138.0.7204.100 → use Chrome/138.0.0.0 in all UAs.
+// حرج: جميع UA strings يجب أن تطابق Chromium المثبت فعلياً.
+// البيئة: chromium-138.0.7204.100 → Chrome/138.0.0.0 في كل UAs.
 export const DEVICE_PROFILES = [
   {
     ua:          "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36",
@@ -32,6 +28,7 @@ export const DEVICE_PROFILES = [
     timezone:    "Asia/Riyadh",
     languages:   ["ar-SA", "ar", "en-US", "en"],
     androidVer:  "14",
+    dpr:         3.0,
   },
   {
     ua:          "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36",
@@ -44,6 +41,7 @@ export const DEVICE_PROFILES = [
     timezone:    "Asia/Dubai",
     languages:   ["ar-AE", "ar", "en-US", "en"],
     androidVer:  "14",
+    dpr:         2.625,
   },
   {
     ua:          "Mozilla/5.0 (Linux; Android 14; SM-A556B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36",
@@ -56,6 +54,7 @@ export const DEVICE_PROFILES = [
     timezone:    "Asia/Kuwait",
     languages:   ["ar-KW", "ar", "en-US", "en"],
     androidVer:  "14",
+    dpr:         2.625,
   },
   {
     ua:          "Mozilla/5.0 (Linux; Android 14; SM-S926B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36",
@@ -68,6 +67,7 @@ export const DEVICE_PROFILES = [
     timezone:    "Asia/Cairo",
     languages:   ["ar-EG", "ar", "en-US", "en"],
     androidVer:  "14",
+    dpr:         3.0,
   },
   {
     ua:          "Mozilla/5.0 (Linux; Android 14; 23129RAA4G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36",
@@ -80,6 +80,7 @@ export const DEVICE_PROFILES = [
     timezone:    "Asia/Baghdad",
     languages:   ["ar-IQ", "ar", "en-US", "en"],
     androidVer:  "14",
+    dpr:         2.75,
   },
   {
     ua:          "Mozilla/5.0 (Linux; Android 14; CPH2609) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36",
@@ -92,6 +93,7 @@ export const DEVICE_PROFILES = [
     timezone:    "Asia/Riyadh",
     languages:   ["ar-SA", "ar", "en-US", "en"],
     androidVer:  "14",
+    dpr:         2.625,
   },
   {
     ua:          "Mozilla/5.0 (Linux; Android 14; 2409BN20AG) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36",
@@ -104,6 +106,7 @@ export const DEVICE_PROFILES = [
     timezone:    "Asia/Muscat",
     languages:   ["ar-OM", "ar", "en-US", "en"],
     androidVer:  "14",
+    dpr:         2.625,
   },
   {
     ua:          "Mozilla/5.0 (Linux; Android 13; SM-F946B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36",
@@ -116,30 +119,104 @@ export const DEVICE_PROFILES = [
     timezone:    "Asia/Riyadh",
     languages:   ["ar-SA", "ar", "en-US", "en"],
     androidVer:  "13",
+    dpr:         2.2,
+  },
+  // profiles إضافية لتقليل التكرار عند وجود حسابات كثيرة
+  {
+    ua:          "Mozilla/5.0 (Linux; Android 14; SM-A546B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36",
+    platform:    "Linux armv8l",
+    vendor:      "Google Inc.",
+    renderer:    "ANGLE (ARM, Xclipse 530, OpenGL ES 3.2 v1.r38p1-00pxl0)",
+    memory:      8,
+    concurrency: 8,
+    screen:      { width: 1080, height: 2340, colorDepth: 24 },
+    timezone:    "Asia/Beirut",
+    languages:   ["ar-LB", "ar", "en-US", "en"],
+    androidVer:  "14",
+    dpr:         2.625,
+  },
+  {
+    ua:          "Mozilla/5.0 (Linux; Android 14; RMX3851) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36",
+    platform:    "Linux armv8l",
+    vendor:      "Google Inc.",
+    renderer:    "ANGLE (Qualcomm, Adreno (TM) 750, OpenGL ES 3.2 V@0700.59)",
+    memory:      12,
+    concurrency: 8,
+    screen:      { width: 1264, height: 2780, colorDepth: 24 },
+    timezone:    "Asia/Amman",
+    languages:   ["ar-JO", "ar", "en-US", "en"],
+    androidVer:  "14",
+    dpr:         2.625,
+  },
+  {
+    ua:          "Mozilla/5.0 (Linux; Android 13; Redmi Note 12 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36",
+    platform:    "Linux armv8l",
+    vendor:      "Google Inc.",
+    renderer:    "ANGLE (ARM, Mali-G99, OpenGL ES 3.2 v1.r38p1-00pxl0)",
+    memory:      8,
+    concurrency: 8,
+    screen:      { width: 1080, height: 2400, colorDepth: 24 },
+    timezone:    "Africa/Cairo",
+    languages:   ["ar-EG", "ar", "en-US", "en"],
+    androidVer:  "13",
+    dpr:         2.75,
+  },
+  {
+    ua:          "Mozilla/5.0 (Linux; Android 14; SM-G996B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36",
+    platform:    "Linux armv8l",
+    vendor:      "Google Inc.",
+    renderer:    "ANGLE (ARM, Xclipse 830, OpenGL ES 3.2 v1.r44p1-00eac0.)",
+    memory:      8,
+    concurrency: 8,
+    screen:      { width: 1080, height: 2400, colorDepth: 24 },
+    timezone:    "Asia/Bahrain",
+    languages:   ["ar-BH", "ar", "en-US", "en"],
+    androidVer:  "14",
+    dpr:         3.0,
   },
 ];
 
 export function pickProfile(sessionId) {
-  // Deterministic per-session but looks random — same account = same device
+  // حتمي per-session: نفس الحساب = نفس الجهاز دائماً
   let hash = 0;
   for (const c of sessionId) hash = (hash * 31 + c.charCodeAt(0)) >>> 0;
   return DEVICE_PROFILES[hash % DEVICE_PROFILES.length];
 }
 
+// ── توليد hash حتمي من sessionId ──────────────────────────────────────────
+// مستخدم لـ noiseSeed وكل القيم "العشوائية" التي يجب أن تكون ثابتة per-session
+function sessionHash(sessionId) {
+  // djb2 hash — بسيط وحتمي
+  let h = 5381;
+  for (let i = 0; i < sessionId.length; i++) {
+    h = ((h << 5) + h + sessionId.charCodeAt(i)) >>> 0;
+  }
+  return h;
+}
+
 // ── Generate the evaluateOnNewDocument script ──────────────────────────────
-export function buildFingerprintScript(profile) {
-  // Tiny per-session canvas noise seed — makes every account unique
-  // but deterministic within the same session (survives page reload)
-  const noiseSeed = Math.floor(Math.random() * 0xFFFFFF);
+// الآن يستقبل sessionId لضمان noiseSeed حتمي per-session
+export function buildFingerprintScript(profile, sessionId) {
+  // إصلاح حرج: noiseSeed حتمي من sessionId
+  // الجهاز الحقيقي ينتج نفس canvas hash في كل مرة — لا يتغير بين restarts
+  const noiseSeed = sessionHash(sessionId) & 0xFFFFFF;
+
+  // إصلاح: حالة الشحن ثابتة per-session (لا تتغير بين page loads)
+  const isCharging = (sessionHash(sessionId + "_charging") % 2) === 0;
+  const batteryLevel = 0.45 + (noiseSeed % 50) * 0.01;
+  // وقت الشحن المتبقي — ثابت وواقعي
+  const dischargingTime = isCharging ? Infinity : (3600 + (noiseSeed % 7200));
+
+  const dpr = profile.dpr ?? 2.625;
 
   return `
 (function() {
   'use strict';
 
-  // ── 1. navigator.webdriver (THE most-checked bot signal) ────────────────
+  // ── 1. navigator.webdriver (الإشارة الأقوى للبوت) ─────────────────────
   Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
 
-  // ── 2. Remove Puppeteer/CDP artifacts ────────────────────────────────────
+  // ── 2. إزالة آثار Puppeteer/CDP ─────────────────────────────────────────
   const cdpKeys = [
     'cdc_adoQpoasnfa76pfcZLmcfl_Array',
     'cdc_adoQpoasnfa76pfcZLmcfl_Promise',
@@ -153,9 +230,7 @@ export function buildFingerprintScript(profile) {
   ];
   cdpKeys.forEach(k => { try { delete window[k]; } catch {} });
 
-  // ── 3. navigator overrides — all derived from the same profile ───────────
-  // CRITICAL: appVersion must match the userAgent exactly (same Chrome version).
-  // A mismatch is detectable via feature-detection scripts.
+  // ── 3. navigator overrides ───────────────────────────────────────────────
   const _ua = ${JSON.stringify(profile.ua)};
   const _appVersion = _ua.replace(/^Mozilla\\//, '');
   Object.defineProperty(navigator, 'platform',    { get: () => ${JSON.stringify(profile.platform)} });
@@ -163,15 +238,15 @@ export function buildFingerprintScript(profile) {
   Object.defineProperty(navigator, 'appVersion',  { get: () => _appVersion });
   Object.defineProperty(navigator, 'userAgent',   { get: () => _ua });
 
-  // ── 4. Languages ──────────────────────────────────────────────────────────
+  // ── 4. اللغات ──────────────────────────────────────────────────────────
   Object.defineProperty(navigator, 'language',  { get: () => ${JSON.stringify(profile.languages[0])} });
   Object.defineProperty(navigator, 'languages', { get: () => ${JSON.stringify(profile.languages)} });
 
-  // ── 5. Hardware ───────────────────────────────────────────────────────────
+  // ── 5. الأجهزة ─────────────────────────────────────────────────────────
   Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => ${profile.concurrency} });
   Object.defineProperty(navigator, 'deviceMemory',        { get: () => ${profile.memory} });
 
-  // ── 6. Plugins (0 plugins = headless red flag) ────────────────────────────
+  // ── 6. Plugins (0 plugins = علامة headless) ─────────────────────────────
   const pluginData = [
     { name: 'Chrome PDF Plugin',      filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
     { name: 'Chrome PDF Viewer',      filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
@@ -192,21 +267,23 @@ export function buildFingerprintScript(profile) {
     get: () => { const arr = []; arr.__proto__ = MimeTypeArray.prototype; return arr; },
   });
 
-  // ── 7. Screen geometry ────────────────────────────────────────────────────
+  // ── 7. Screen geometry ─────────────────────────────────────────────────
   const sc = ${JSON.stringify(profile.screen)};
+  const _dpr = ${dpr};
   Object.defineProperty(screen, 'width',       { get: () => sc.width });
   Object.defineProperty(screen, 'height',      { get: () => sc.height });
   Object.defineProperty(screen, 'availWidth',  { get: () => sc.width });
   Object.defineProperty(screen, 'availHeight', { get: () => sc.height - 48 });
   Object.defineProperty(screen, 'colorDepth',  { get: () => sc.colorDepth });
   Object.defineProperty(screen, 'pixelDepth',  { get: () => sc.colorDepth });
-  Object.defineProperty(window, 'devicePixelRatio', { get: () => 2.625 });
+  Object.defineProperty(window, 'devicePixelRatio', { get: () => _dpr });
   Object.defineProperty(window, 'innerWidth',  { get: () => sc.width });
   Object.defineProperty(window, 'innerHeight', { get: () => sc.height - 100 });
   Object.defineProperty(window, 'outerWidth',  { get: () => sc.width });
   Object.defineProperty(window, 'outerHeight', { get: () => sc.height });
 
-  // ── 8. Canvas fingerprint noise ───────────────────────────────────────────
+  // ── 8. Canvas fingerprint noise — حتمي per-session ──────────────────────
+  // إصلاح: NOISE_SEED مشتق من sessionId، لا يتغير بين restarts
   const NOISE_SEED = ${noiseSeed};
   const _toDataURL  = HTMLCanvasElement.prototype.toDataURL;
   const _getCtxOrig = HTMLCanvasElement.prototype.getContext;
@@ -222,7 +299,7 @@ export function buildFingerprintScript(profile) {
     return _toDataURL.call(this, type, quality);
   };
 
-  // ── 9. WebGL vendor + renderer spoofing ───────────────────────────────────
+  // ── 9. WebGL vendor + renderer ─────────────────────────────────────────
   const _getParam  = WebGLRenderingContext.prototype.getParameter;
   const _getParam2 = WebGL2RenderingContext && WebGL2RenderingContext.prototype.getParameter;
   const WEBGL_VENDOR   = ${JSON.stringify(profile.vendor)};
@@ -239,46 +316,51 @@ export function buildFingerprintScript(profile) {
   WebGLRenderingContext.prototype.getParameter = spoofWebGL(_getParam);
   if (_getParam2) WebGL2RenderingContext.prototype.getParameter = spoofWebGL(_getParam2);
 
-  // ── 10. AudioContext fingerprint noise ────────────────────────────────────
-  const _createAnalyser = AudioContext.prototype.createAnalyser;
-  AudioContext.prototype.createAnalyser = function() {
-    const analyser = _createAnalyser.call(this);
-    const _getFloat32 = analyser.getFloatFrequencyData.bind(analyser);
-    analyser.getFloatFrequencyData = function(array) {
-      _getFloat32(array);
-      for (let i = 0; i < array.length; i++) {
-        array[i] += (NOISE_SEED % 100) * 0.0001;
-      }
+  // ── 10. AudioContext fingerprint noise ─────────────────────────────────
+  try {
+    const _createAnalyser = AudioContext.prototype.createAnalyser;
+    AudioContext.prototype.createAnalyser = function() {
+      const analyser = _createAnalyser.call(this);
+      const _getFloat32 = analyser.getFloatFrequencyData.bind(analyser);
+      analyser.getFloatFrequencyData = function(array) {
+        _getFloat32(array);
+        for (let i = 0; i < array.length; i++) {
+          array[i] += (NOISE_SEED % 100) * 0.0001;
+        }
+      };
+      return analyser;
     };
-    return analyser;
-  };
+  } catch {}
 
-  // ── 11. Battery API (fake realistic state) ────────────────────────────────
+  // ── 11. Battery API — ثابت per-session (إصلاح: لا تتغير حالة الشحن) ─────
+  // مشتقة من sessionId → نفس القيمة في كل page load
   if ('getBattery' in navigator) {
     const fakeBattery = {
-      charging: Math.random() > 0.4,
-      chargingTime: 0,
-      dischargingTime: Infinity,
-      level: 0.45 + (NOISE_SEED % 50) * 0.01,
+      charging:         ${isCharging},
+      chargingTime:     ${isCharging ? 0 : 'Infinity'},
+      dischargingTime:  ${dischargingTime},
+      level:            ${batteryLevel.toFixed(4)},
       addEventListener: () => {},
       removeEventListener: () => {},
-      dispatchEvent: () => true,
+      dispatchEvent:    () => true,
     };
     navigator.getBattery = () => Promise.resolve(fakeBattery);
   }
 
-  // ── 12. Network Information API ───────────────────────────────────────────
-  if ('connection' in navigator) {
-    Object.defineProperties(navigator.connection || {}, {
-      type:           { get: () => 'wifi' },
-      effectiveType:  { get: () => '4g' },
-      rtt:            { get: () => 50 + (NOISE_SEED % 30) },
-      downlink:       { get: () => 8 + (NOISE_SEED % 15) },
-      saveData:       { get: () => false },
-    });
+  // ── 12. Network Information API ────────────────────────────────────────
+  if (navigator.connection) {
+    try {
+      Object.defineProperties(navigator.connection, {
+        type:           { get: () => 'wifi',   configurable: true },
+        effectiveType:  { get: () => '4g',     configurable: true },
+        rtt:            { get: () => 50 + (NOISE_SEED % 30), configurable: true },
+        downlink:       { get: () => 8 + (NOISE_SEED % 15),  configurable: true },
+        saveData:       { get: () => false,    configurable: true },
+      });
+    } catch {}
   }
 
-  // ── 13. WebRTC IP leak prevention ────────────────────────────────────────
+  // ── 13. WebRTC IP leak prevention ─────────────────────────────────────
   const _RTCPeerConnection = window.RTCPeerConnection
     || window.webkitRTCPeerConnection
     || window.mozRTCPeerConnection;
@@ -293,7 +375,7 @@ export function buildFingerprintScript(profile) {
     window.webkitRTCPeerConnection = SafeRTC;
   }
 
-  // ── 14. Media devices (fake camera/mic — real browsers have them) ─────────
+  // ── 14. Media devices ─────────────────────────────────────────────────
   if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
     navigator.mediaDevices.enumerateDevices = async () => [
       { deviceId: 'default', kind: 'audioinput',  label: 'Default Microphone', groupId: 'default' },
@@ -302,7 +384,7 @@ export function buildFingerprintScript(profile) {
     ];
   }
 
-  // ── 15. Permissions API ────────────────────────────────────────────────────
+  // ── 15. Permissions API ────────────────────────────────────────────────
   if (navigator.permissions && navigator.permissions.query) {
     const _permQuery = navigator.permissions.query.bind(navigator.permissions);
     navigator.permissions.query = async (descriptor) => {
@@ -314,7 +396,7 @@ export function buildFingerprintScript(profile) {
     };
   }
 
-  // ── 16. Chrome runtime (headless has window.chrome = undefined) ───────────
+  // ── 16. Chrome runtime ────────────────────────────────────────────────
   if (!window.chrome) {
     window.chrome = {
       runtime: { id: undefined },
@@ -324,22 +406,20 @@ export function buildFingerprintScript(profile) {
     };
   }
 
-  // ── 17. Touch support (mobile devices must have touch) ────────────────────
+  // ── 17. Touch support ─────────────────────────────────────────────────
   try {
     Object.defineProperty(navigator, 'maxTouchPoints',   { get: () => 5 });
     Object.defineProperty(navigator, 'msMaxTouchPoints', { get: () => 5 });
   } catch {}
 
-  // ── 18. Notification API ──────────────────────────────────────────────────
+  // ── 18. Notification API ─────────────────────────────────────────────
   if (typeof Notification !== 'undefined') {
     try {
       Object.defineProperty(Notification, 'permission', { get: () => 'default' });
     } catch {}
   }
 
-  // ── 19. Timezone consistency ──────────────────────────────────────────────
-  // Intl.DateTimeFormat must report the same timezone as the profile.
-  // This prevents mismatch between navigator.language (ar-SA) and UTC timezone.
+  // ── 19. Timezone consistency ──────────────────────────────────────────
   const _DateTimeFormat = Intl.DateTimeFormat;
   Intl.DateTimeFormat = function(locale, options) {
     if (!options || !options.timeZone) {
@@ -349,13 +429,12 @@ export function buildFingerprintScript(profile) {
   };
   Object.assign(Intl.DateTimeFormat, _DateTimeFormat);
 
-  // ── 20. Speech synthesis voices (headless = 0 voices, mobile = many) ──────
+  // ── 20. Speech synthesis voices ───────────────────────────────────────
   if (window.speechSynthesis) {
     const _getVoices = window.speechSynthesis.getVoices.bind(window.speechSynthesis);
     window.speechSynthesis.getVoices = () => {
       const real = _getVoices();
       if (real && real.length > 0) return real;
-      // Return a fake Arabic voice list if browser has none
       return [
         { default: true, lang: ${JSON.stringify(profile.languages[0])}, localService: false,
           name: 'Google Arabic', voiceURI: 'Google Arabic' },

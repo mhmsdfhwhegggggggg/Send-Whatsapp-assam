@@ -59,12 +59,9 @@ export async function workerGetAllSessions(): Promise<Record<string, SessionStat
 }
 
 /**
- * Check if a phone number is registered on WhatsApp.
- * Call this BEFORE sending to avoid error spikes on invalid numbers.
- * Returns true = registered, false = not on WhatsApp or worker unavailable.
- *
- * This is one of the most important anti-ban signals: sending to non-WA
- * numbers raises your error rate and triggers spam detection faster.
+ * التحقق من تسجيل رقم هاتف في واتساب.
+ * يجب الاستدعاء قبل الإرسال لتجنب الأرقام غير المسجلة.
+ * الإرسال لأرقام غير مسجلة يرفع معدل الخطأ ويُشغّل كشف Spam.
  */
 export async function workerCheckPhone(
   sessionId: string,
@@ -75,24 +72,38 @@ export async function workerCheckPhone(
       method: "POST",
       body: JSON.stringify({ sessionId, phone }),
     });
-    if (!res.ok) return { registered: true }; // Fail open: don't block on worker issues
+    if (!res.ok) return { registered: true }; // fail-open
     const body = await res.json() as { registered: boolean };
     return body;
   } catch (e) {
-    // Worker unreachable — fail open (don't block the campaign)
     logger.warn({ sessionId, phone, err: (e as Error).message }, "check-phone: worker unreachable");
     return { registered: true };
   }
 }
 
 /**
- * Send a message through the worker.
- * humanMode=true (default) tells the worker to:
- *   1. Mark the chat as read
- *   2. Show typing indicator for realistic duration (corrected Arabic speed)
- *   3. Multi-phase typing simulation with mid-message pause for long texts
- *   4. Brief review hesitation
- *   5. Then actually send
+ * ضبط حالة الـ presence للحساب عبر الـ worker.
+ * [جديد v3] يُستدعى من organicBreathe في campaign-runner
+ * لإرسال إشارة presence حقيقية إلى واتساب.
+ */
+export async function workerSetPresence(
+  sessionId: string,
+  available: boolean,
+): Promise<void> {
+  try {
+    await workerFetch("/presence", {
+      method: "POST",
+      body: JSON.stringify({ sessionId, available }),
+    });
+  } catch (e) {
+    // غير حرج — فقط نُسجّل التحذير
+    logger.warn({ sessionId, err: (e as Error).message }, "workerSetPresence: failed");
+  }
+}
+
+/**
+ * إرسال رسالة عبر الـ worker.
+ * humanMode=true (افتراضي): محاكاة كاملة للكتابة البشرية
  */
 export async function workerSendMessage(
   sessionId: string,

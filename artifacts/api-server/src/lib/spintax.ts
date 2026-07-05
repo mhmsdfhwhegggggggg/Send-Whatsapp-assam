@@ -1,19 +1,9 @@
 /**
- * spintax.ts — Advanced message variation engine — PRODUCTION HARDENED v2
+ * spintax.ts — Advanced message variation engine — PRODUCTION HARDENED v3
  *
- * Layers applied in order:
- *   1. Multi-level spintax {a|b|{c|d}}
- *   2. Fill named variables (name, university, discount, serviceType, city)
- *   3. Arabic diacritics (tashkeel) variation
- *   4. Unicode Arabic homoglyphs (invisible substitution)
- *   5. Emoji injection at random positions
- *   6. Multi-point invisible zero-width characters
- *   7. Sentence-level structural variation (optional postscript)
- *
- * New in v2:
- *   - calculateSpamScore(): pre-send content risk assessment
- *   - Extended fillVars with city variable
- *   - More diacritics patterns
+ * إصلاحات v3:
+ *   - normalizeArabicPhone(): تطبيع أرقام الهاتف العربية (05xx → 9665xx)
+ *   - sanitizePhone() يستخدم normalizeArabicPhone داخلياً
  */
 
 // ── 1. Multi-level Spintax ─────────────────────────────────────────────────
@@ -70,7 +60,7 @@ export function applyDiacriticsVariation(text: string): string {
   return result;
 }
 
-// ── 4. Arabic homoglyphs (visually identical substitutions) ────────────────
+// ── 4. Arabic homoglyphs ──────────────────────────────────────────────────
 const HOMOGLYPHS: [string, string][] = [
   ["ك", "\u06A9"],   // Arabic Farsi Keh
   ["ي", "\u06CC"],   // Arabic Farsi Yeh
@@ -126,7 +116,7 @@ const POSTSCRIPTS = [
   "\n\nيسعدنا خدمتك",
   "\n\nللمزيد من المعلومات تواصل معنا",
   "\n\nنحن في خدمتك دائماً",
-  "",  // No postscript — included 3× to reduce frequency
+  "",  // No postscript — x3
   "",
   "",
 ];
@@ -137,9 +127,6 @@ export function applyPostscript(text: string): string {
 }
 
 // ── Spam score calculator ─────────────────────────────────────────────────
-// Pre-send risk assessment: estimate likelihood WhatsApp ML flags this message.
-// Returns score 0–100. Score > 60 = high risk, reject send.
-// Score 40–60 = moderate, proceed with caution.
 export interface SpamScoreResult {
   score: number;
   reasons: string[];
@@ -150,62 +137,55 @@ export function calculateSpamScore(text: string): SpamScoreResult {
   const reasons: string[] = [];
   let score = 0;
 
-  // URL presence — major signal
   if (/https?:\/\//i.test(text)) {
     score += 25;
     reasons.push("contains URL (+25)");
   }
 
-  // Multiple URLs
   const urlCount = (text.match(/https?:\/\//gi) ?? []).length;
   if (urlCount > 1) {
     score += 15;
     reasons.push(`multiple URLs × ${urlCount} (+15)`);
   }
 
-  // Sales/marketing keywords
   const salesWords = /عرض|خصم|مجاني|مجانا|احصل|اشترك|سارع|محدود|فرصة|ترقية|تخفيض|وفر/i;
   if (salesWords.test(text)) {
     score += 15;
     reasons.push("marketing keywords (+15)");
   }
 
-  // All-caps segments
   if (/[A-Z]{5,}/.test(text)) {
     score += 10;
     reasons.push("ALL CAPS block (+10)");
   }
 
-  // Excessive exclamation/question marks
   const punctCount = (text.match(/[!?]{2,}/g) ?? []).length;
   if (punctCount > 0) {
     score += punctCount * 5;
     reasons.push(`repeated punctuation ×${punctCount} (+${punctCount * 5})`);
   }
 
-  // Message too long
-  if (text.length > 600) {
+  // حساب طول الرسالة بدون الأحرف الخفية (لمنع التحايل)
+  const visibleLength = text.replace(/[\u200B\u200C\u200D\uFEFF\u2060\u180E]/g, "").length;
+  if (visibleLength > 600) {
     score += 15;
-    reasons.push(`too long (${text.length} chars, +15)`);
-  } else if (text.length > 400) {
+    reasons.push(`too long (${visibleLength} chars, +15)`);
+  } else if (visibleLength > 400) {
     score += 8;
     reasons.push(`long message (+8)`);
   }
 
-  // Phone numbers in text
   if (/\b\d{9,14}\b/.test(text)) {
     score += 20;
     reasons.push("phone number in text (+20)");
   }
 
-  // Too many emojis
   const emojiCount = (text.match(/[\u{1F300}-\u{1FAFF}]/gu) ?? []).length;
   if (emojiCount > 5) {
     score += 10;
     reasons.push(`emoji overload ×${emojiCount} (+10)`);
   }
 
-  // Forwarded content markers
   if (/تمت إعادة التوجيه|forwarded|تمت اعادة/i.test(text)) {
     score += 20;
     reasons.push("forwarded message marker (+20)");
@@ -216,16 +196,81 @@ export function calculateSpamScore(text: string): SpamScoreResult {
   return { score: Math.min(score, 100), reasons, risk };
 }
 
-// ── Sanitize phone number ──────────────────────────────────────────────────
-export function sanitizePhone(raw: string): string {
-  const digits = raw.replace(/[\s\-\+\(\)]/g, "");
-  if (!/^\d{9,15}$/.test(digits)) {
-    throw new Error(`Invalid phone number: ${raw}`);
+// ── تطبيع أرقام الهاتف العربية ───────────────────────────────────────────
+/**
+ * يُحوّل الأرقام المحلية إلى صيغة دولية (بدون +) يفهمها واتساب.
+ *
+ * أمثلة:
+ *   "0501234567"   → "966501234567"  (السعودية)
+ *   "05xxxxxxxx"   → "96605xxxxxxxx" خطأ: يجب "966501234567"
+ *   "+966501234567" → "966501234567"
+ *   "966501234567" → "966501234567"  (لا تغيير)
+ *   "0097150..."   → "97150..."      (الإمارات بـ00)
+ *
+ * يشمل: السعودية (966)، الإمارات (971)، الكويت (965)،
+ *        قطر (974)، البحرين (973)، عُمان (968)،
+ *        مصر (20)، الأردن (962)، العراق (964)، لبنان (961)، المغرب (212).
+ */
+export function normalizeArabicPhone(raw: string): string {
+  // أزل كل شيء ما عدا الأرقام والـ +
+  let digits = raw.replace(/[\s\-\(\)]/g, "");
+
+  // أزل الـ + الأمامي
+  if (digits.startsWith("+")) digits = digits.slice(1);
+
+  // أزل بادئة 00 (00966 → 966)
+  if (digits.startsWith("00")) digits = digits.slice(2);
+
+  // خرائط الدول: بادئة محلية → كود دولي + عدد الأرقام الإجمالي
+  const localPrefixes: [string, string, number][] = [
+    // بادئة، كود دولي،  عدد الأرقام في الرقم المحلي (شامل الصفر)
+    ["05", "966", 10],  // السعودية: 05xxxxxxxx → 966 + 5xxxxxxxx
+    ["06", "966", 10],  // السعودية بعض المناطق
+    ["07", "966", 10],
+    ["04", "971", 10],  // الإمارات: 04xxxxxxx → 971 + 4xxxxxxx (مختلف)
+    ["05", "971", 10],  // الإمارات موبايل أحياناً
+    ["06", "965", 8],   // الكويت: 6xxxxxxx (8 أرقام)
+    ["5",  "974", 8],   // قطر: 5xxxxxxx (8 أرقام)
+    ["3",  "974", 8],   // قطر
+    ["7",  "974", 8],   // قطر
+    ["010","20",  11],  // مصر: 010xxxxxxxx → 20 + 10xxxxxxxx
+    ["011","20",  11],  // مصر
+    ["012","20",  11],  // مصر
+    ["015","20",  11],  // مصر
+    ["07", "964", 11],  // العراق
+    ["078","964", 11],
+    ["079","964", 11],
+  ];
+
+  // إذا الرقم يبدأ بصفر — قد يحتاج تحويل
+  if (digits.startsWith("0")) {
+    for (const [prefix, countryCode, expectedLen] of localPrefixes) {
+      if (digits.startsWith(prefix) && digits.length === expectedLen) {
+        // أزل الصفر الأول وأضف كود الدولة
+        // مثال: "0501234567" (10 أرقام، prefix "05", code "966")
+        //        → أزل "0" → "501234567" → "966" + "501234567" = "966501234567"
+        digits = countryCode + digits.slice(1);
+        break;
+      }
+    }
   }
+
   return digits;
 }
 
-// ── Master function: apply all layers ─────────────────────────────────────
+// ── Sanitize phone number ──────────────────────────────────────────────────
+export function sanitizePhone(raw: string): string {
+  // أولاً: طبّق التطبيع العربي
+  const normalized = normalizeArabicPhone(raw);
+
+  // ثم تحقق من الصحة (9–15 رقماً، أرقام فقط)
+  if (!/^\d{9,15}$/.test(normalized)) {
+    throw new Error(`Invalid phone number: "${raw}" (normalized: "${normalized}")`);
+  }
+  return normalized;
+}
+
+// ── Master function ────────────────────────────────────────────────────────
 export function buildUniqueMessage(
   template: string,
   vars: Record<string, string | undefined>,

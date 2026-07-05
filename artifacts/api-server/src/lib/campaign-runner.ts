@@ -1,21 +1,12 @@
 /**
- * campaign-runner.ts — PRODUCTION HARDENED v2
+ * campaign-runner.ts — PRODUCTION HARDENED v4
  *
- * Anti-ban layers applied here:
- *   1. Tiered daily limits (new/warm/hot) — enforces warm-up curve
- *   2. Poisson-distributed inter-message delays — not uniform random
- *   3. Time-of-day weighting — biased toward realistic waking hours
- *   4. Per-message kill-switch check — halts mid-batch within seconds
- *   5. Persistent account health score (DB-backed, survives restarts)
- *   6. Opt-out matching with phone normalization
- *   7. Full message variation via buildUniqueMessage (7 layers)
- *   8. Human mode flag sent to worker (/send with humanMode:true)
- *   9. [NEW v2] Phone validation before send (workerCheckPhone)
- *  10. [NEW v2] Spam score gate: blocks high-risk messages pre-send
- *  11. [NEW v2] Organic breathing between messages (presence toggle)
- *  12. [NEW v2] Account events logged to DB for early-warning system
- *  13. [NEW v2] Account suspension check (suspendedUntil column)
- *  14. [NEW v2] Contextual personalization (city, university, serviceType)
+ * إصلاحات v4:
+ *   1. [إصلاح] getCachedHealth — حُذف الـ argument الثاني الخاطئ
+ *   2. [إصلاح] organicBreathe — ترسل الآن presence signals حقيقية عبر workerSetPresence
+ *   3. [إصلاح] timezone — currentHourInTz() يستخدم SEND_TIMEZONE (افتراضي: Asia/Riyadh)
+ *   4. [جديد]  dedup check — فحص الإرسال لنفس الرقم خلال dedupWindowDays
+ *   5. [إصلاح] retry — يستبعد الحساب الفاشل من المحاولة التالية
  */
 
 import { db } from "@workspace/db";
@@ -23,9 +14,9 @@ import {
   campaignsTable, messagesTable, accountsTable,
   settingsTable, templatesTable, optOutTable, studentsTable,
 } from "@workspace/db/schema";
-import { eq, inArray, and, sql, or } from "drizzle-orm";
+import { eq, inArray, and, sql, gte } from "drizzle-orm";
 import { buildUniqueMessage, sanitizePhone, calculateSpamScore } from "./spintax";
-import { workerSendMessage, workerCheckPhone } from "./worker-client";
+import { workerSendMessage, workerCheckPhone, workerSetPresence } from "./worker-client";
 import { logAccountEvent, updateHealthScore, hasHighDisconnectRate } from "./warm-up";
 import { logger } from "./logger";
 
@@ -42,6 +33,26 @@ function todayStr(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+// ── إصلاح: الساعة الحالية في timezone الصحيح ─────────────────────────────
+// كان النظام يستخدم server timezone (UTC في Replit) بينما المستهدفون في
+// منطقة زمنية مختلفة (مثلاً Asia/Riyadh = UTC+3).
+// اضبط SEND_TIMEZONE في البيئة — الافتراضي: Asia/Riyadh
+const SEND_TIMEZONE = process.env.SEND_TIMEZONE ?? "Asia/Riyadh";
+
+function currentHourInTz(timezone = SEND_TIMEZONE): number {
+  try {
+    const formatted = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      hour: "numeric",
+      hour12: false,
+    }).format(new Date());
+    return parseInt(formatted, 10);
+  } catch {
+    // fallback: server local hour
+    return new Date().getHours();
+  }
+}
+
 // ── Poisson-distributed delay ──────────────────────────────────────────────
 function poissonDelay(lambdaMs: number, minMs: number, maxMs: number): number {
   const raw = -Math.log(1 - Math.random()) * lambdaMs;
@@ -50,7 +61,7 @@ function poissonDelay(lambdaMs: number, minMs: number, maxMs: number): number {
 
 // ── Time-of-day score: peaks at 9-12h, 14-17h, 19-21h ───────────────────
 function timeOfDayScore(): number {
-  const h = new Date().getHours();
+  const h = currentHourInTz();
   const peaks = [[9, 12], [14, 17], [19, 21]] as [number, number][];
   for (const [start, end] of peaks) {
     if (h >= start && h < end) return 1;
@@ -103,16 +114,8 @@ function isSuspended(acc: AccRow): boolean {
 }
 
 // ── Account health score (persistent + cache) ─────────────────────────────
-// Source of truth: accountsTable.healthScore (persisted in DB).
-// In-memory cache used only to reduce DB reads per message.
-// CRITICAL: cache is ALWAYS seeded from DB on first access — never defaults
-// to 100. This ensures degraded accounts stay degraded across server restarts.
 const sessionHealthCache = new Map<string, number>();
 
-/**
- * Hydrate cache from DB for an account if not already cached.
- * Must be called before any health read/write for correctness after restart.
- */
 async function hydrateHealthCache(accountId: string): Promise<number> {
   if (sessionHealthCache.has(accountId)) return sessionHealthCache.get(accountId)!;
   const [acc] = await db.select({ healthScore: accountsTable.healthScore })
@@ -122,17 +125,15 @@ async function hydrateHealthCache(accountId: string): Promise<number> {
   return score;
 }
 
+// إصلاح: الدالة تقبل argument واحداً فقط (الـ dbScore الثاني كان خطأً)
 function getCachedHealth(accountId: string): number {
-  // Cache must already be hydrated (via hydrateHealthCache) before calling this.
   return sessionHealthCache.get(accountId) ?? 100;
 }
 
 async function recordSuccess(accountId: string, settings: SettingsRow): Promise<void> {
-  // Ensure we start from the real persisted score, not 100
   const current  = await hydrateHealthCache(accountId);
   const newScore = Math.min(100, current + 0.5);
   sessionHealthCache.set(accountId, newScore);
-  // Persist every ~10 successes to reduce DB writes
   if (Math.random() < 0.1) {
     await updateHealthScore(accountId, +0.5, settings);
     await logAccountEvent(accountId, "send_ok");
@@ -140,14 +141,12 @@ async function recordSuccess(accountId: string, settings: SettingsRow): Promise<
 }
 
 async function recordFailure(accountId: string, settings: SettingsRow, error?: string): Promise<void> {
-  // Ensure we start from the real persisted score, not 100
   const current  = await hydrateHealthCache(accountId);
   const failRate = 1 - (current / 100);
   const delta    = failRate > 0.3 ? -10 : -3;
   const newScore = Math.max(0, current + delta);
   sessionHealthCache.set(accountId, newScore);
 
-  // Always persist failures immediately (high-signal events)
   await updateHealthScore(accountId, delta, settings);
   await logAccountEvent(accountId, "send_fail", error);
 
@@ -157,8 +156,8 @@ async function recordFailure(accountId: string, settings: SettingsRow, error?: s
 }
 
 async function isHealthy(accountId: string, dbScore: number, threshold: number): Promise<boolean> {
-  // Hydrate from DB score on cache miss — never assume 100
   if (!sessionHealthCache.has(accountId)) sessionHealthCache.set(accountId, dbScore);
+  // إصلاح: استخدام getCachedHealth بدون الـ argument الثاني
   return getCachedHealth(accountId) >= threshold;
 }
 
@@ -174,7 +173,11 @@ async function resetIfNeeded(accountId: string) {
 }
 
 // ── Account picker ─────────────────────────────────────────────────────────
-async function pickAccount(accountIds: string[], settings: SettingsRow): Promise<string | null> {
+async function pickAccount(
+  accountIds: string[],
+  settings: SettingsRow,
+  excludeIds: Set<string> = new Set(),
+): Promise<string | null> {
   const accounts = await db.select().from(accountsTable)
     .where(inArray(accountsTable.id, accountIds));
 
@@ -182,6 +185,8 @@ async function pickAccount(accountIds: string[], settings: SettingsRow): Promise
   const candidates: { id: string; remaining: number; score: number }[] = [];
 
   for (const acc of accounts) {
+    // إصلاح: استبعاد الحسابات الفاشلة في هذه الدورة (للـ retry بحساب مختلف)
+    if (excludeIds.has(acc.id)) continue;
     if (acc.status !== "connected") continue;
     if (isSuspended(acc)) {
       logger.info({ accountId: acc.id, until: acc.suspendedUntil }, "skipped: account suspended");
@@ -193,7 +198,6 @@ async function pickAccount(accountIds: string[], settings: SettingsRow): Promise
       continue;
     }
 
-    // Check disconnect rate (early warning signal)
     const highDisconnect = await hasHighDisconnectRate(acc.id);
     if (highDisconnect) {
       logger.warn({ accountId: acc.id }, "skipped: high disconnect rate in past 2h");
@@ -204,13 +208,13 @@ async function pickAccount(accountIds: string[], settings: SettingsRow): Promise
     const limit     = getDailyLimit(acc, settings);
     const sentToday = acc.lastResetDate === today ? acc.sentToday : 0;
     const remaining = limit - sentToday;
-    const score     = getCachedHealth(acc.id, dbScore);
+    // إصلاح: getCachedHealth بدون الـ argument الثاني
+    const score     = getCachedHealth(acc.id);
     if (remaining > 0) candidates.push({ id: acc.id, remaining, score });
   }
 
   if (candidates.length === 0) return null;
 
-  // Weighted random: accounts with more remaining capacity AND higher health
   const weights = candidates.map(c => c.remaining * (c.score / 100));
   const total   = weights.reduce((a, b) => a + b, 0);
   let r = Math.random() * total;
@@ -232,21 +236,43 @@ async function incSent(accountId: string) {
     .where(eq(accountsTable.id, accountId));
 }
 
-// ── Organic breathing ──────────────────────────────────────────────────────
-// 15% chance between messages to do something "organic" on WhatsApp.
-// This simulates the account being a real person who does other things.
+// ── Dedup check — [جديد v4] ───────────────────────────────────────────────
+// يمنع إرسال رسالة لنفس الرقم أكثر من مرة خلال dedupWindowDays.
+async function isRecentlySent(phone: string, dedupWindowDays: number): Promise<boolean> {
+  if (dedupWindowDays <= 0) return false;
+  const since = new Date(Date.now() - dedupWindowDays * 86_400_000);
+  const [row] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(messagesTable)
+    .where(and(
+      eq(messagesTable.phone, phone),
+      eq(messagesTable.status, "sent"),
+      gte(messagesTable.sentAt, since),
+    ));
+  return (row?.count ?? 0) > 0;
+}
+
+// ── Organic breathing — [إصلاح v4] ────────────────────────────────────────
+// ترسل الآن presence signals حقيقية عبر workerSetPresence بدلاً من النوم فقط
 async function organicBreathe(accountId: string): Promise<void> {
   const r = Math.random();
+
   if (r < 0.08) {
-    // 8%: brief offline moment (phone put down, picked up)
+    // 8%: توقف قصير (وضع الهاتف) + presence offline حقيقية
     logger.debug({ accountId }, "organic: brief offline");
-    await sleep(20000 + Math.random() * 40000); // 20–60 seconds
+    await workerSetPresence(accountId, false);
+    await sleep(20000 + Math.random() * 40000); // 20–60 ثانية
+    await workerSetPresence(accountId, true);
+
   } else if (r < 0.13) {
-    // 5%: extended pause (2–5 min, phone on table)
+    // 5%: توقف ممتد (2–5 دقائق) + presence offline
     logger.debug({ accountId }, "organic: extended pause");
+    await workerSetPresence(accountId, false);
     await sleep(2 * 60000 + Math.random() * 3 * 60000);
+    await workerSetPresence(accountId, true);
+
   }
-  // 87%: just continue normally
+  // 87%: استمر بشكل طبيعي
 }
 
 // ── Public entry point ─────────────────────────────────────────────────────
@@ -269,7 +295,7 @@ async function _run(campaignId: string): Promise<void> {
 
   for (const aid of accountIds) await resetIfNeeded(aid);
 
-  // Pre-validate: check spam score on base template
+  // Pre-validate: فحص spam score على القالب الأساسي
   const baseSpamScore = calculateSpamScore(template.body);
   if (baseSpamScore.risk === "high") {
     logger.warn({ campaignId, score: baseSpamScore.score, reasons: baseSpamScore.reasons },
@@ -281,7 +307,6 @@ async function _run(campaignId: string): Promise<void> {
   }
 
   while (true) {
-    // ── Reload fresh state ───────────────────────────────────────────────
     const [fresh] = await db.select().from(campaignsTable).where(eq(campaignsTable.id, campaignId));
     if (!fresh || fresh.status !== "running") break;
 
@@ -294,24 +319,29 @@ async function _run(campaignId: string): Promise<void> {
       break;
     }
 
-    // ── Working hours ────────────────────────────────────────────────────
-    const h = new Date().getHours();
-    if (h < settings.workingHoursStart || h >= settings.workingHoursEnd) {
-      logger.info({ campaignId }, "outside hours — sleep 5min");
+    // ── Working hours — إصلاح: timezone صحيح ────────────────────────────
+    const currentHour = currentHourInTz();
+    if (currentHour < settings.workingHoursStart || currentHour >= settings.workingHoursEnd) {
+      logger.info({
+        campaignId,
+        currentHour,
+        timezone: SEND_TIMEZONE,
+        workingHours: `${settings.workingHoursStart}–${settings.workingHoursEnd}`,
+      }, "outside hours — sleep 5min");
       await sleep(5 * 60_000);
       continue;
     }
-    // Low-score time window: sleep briefly and retry
+
     if (timeOfDayScore() < 0.5 && Math.random() > 0.3) {
       await sleep(2 * 60_000);
       continue;
     }
 
-    // ── Opt-out set (normalized) ─────────────────────────────────────────
+    // ── Opt-out set ──────────────────────────────────────────────────────
     const optRows = await db.select({ phone: optOutTable.phone }).from(optOutTable);
     const optOut  = new Set(optRows.map(r => normalizePhone(r.phone)));
 
-    // ── Pending batch ─────────────────────────────────────────────────────
+    // ── Pending batch ────────────────────────────────────────────────────
     const pending = await db.select().from(messagesTable)
       .where(and(eq(messagesTable.campaignId, campaignId), eq(messagesTable.status, "pending")))
       .limit(fresh.batchSize);
@@ -334,7 +364,7 @@ async function _run(campaignId: string): Promise<void> {
         return;
       }
 
-      // ── Phone validation + opt-out check ─────────────────────────────
+      // ── Phone validation + opt-out ────────────────────────────────────
       let phone: string;
       try { phone = sanitizePhone(msg.phone); }
       catch (e) {
@@ -349,17 +379,32 @@ async function _run(campaignId: string): Promise<void> {
         continue;
       }
 
+      // ── [جديد v4] Dedup check ─────────────────────────────────────────
+      // يمنع إرسال رسالة لنفس الرقم مرتين خلال نافذة dedupWindowDays
+      if (liveSettings.dedupWindowDays > 0) {
+        const alreadySent = await isRecentlySent(phone, liveSettings.dedupWindowDays);
+        if (alreadySent) {
+          logger.info({ campaignId, phone, dedupWindowDays: liveSettings.dedupWindowDays },
+            "skipping: already sent to this number recently (dedup)");
+          await db.update(messagesTable)
+            .set({ status: "failed", error: `dedup: sent within last ${liveSettings.dedupWindowDays} days` })
+            .where(eq(messagesTable.id, msg.id));
+          continue;
+        }
+      }
+
       // ── Pick account ──────────────────────────────────────────────────
-      const accountId = await pickAccount(accountIds, liveSettings);
+      // إصلاح: نتتبع الحسابات الفاشلة لاستبعادها في retry
+      const failedAccountsThisMsg = new Set<string>();
+      let accountId = await pickAccount(accountIds, liveSettings, failedAccountsThisMsg);
+
       if (!accountId) {
         logger.warn({ campaignId }, "no account available — sleep 5min");
         await sleep(5 * 60_000);
         break;
       }
 
-      // ── WhatsApp phone validation (NEW v2) ───────────────────────────
-      // Only send to numbers that are actually on WhatsApp.
-      // Sending to non-WA numbers raises error rate and triggers spam detection.
+      // ── WhatsApp phone validation ─────────────────────────────────────
       if (liveSettings.phoneValidationEnabled) {
         const check = await workerCheckPhone(accountId, phone);
         if (!check.registered) {
@@ -369,13 +414,12 @@ async function _run(campaignId: string): Promise<void> {
             .where(eq(messagesTable.id, msg.id));
           continue;
         }
-        // Mark as verified
         await db.update(messagesTable)
           .set({ phoneVerified: true })
           .where(eq(messagesTable.id, msg.id));
       }
 
-      // ── Fetch student data for contextual personalization ─────────────
+      // ── Fetch student data for personalization ────────────────────────
       let studentVars: Record<string, string | undefined> = { name: msg.studentName };
       if (msg.studentId) {
         const [student] = await db.select().from(studentsTable)
@@ -391,7 +435,7 @@ async function _run(campaignId: string): Promise<void> {
         }
       }
 
-      // ── Build unique message (7 variation layers) ────────────────────
+      // ── Build unique message (7 variation layers) ─────────────────────
       const text = buildUniqueMessage(template.body, studentVars, {
         spintax:        liveSettings.spintaxEnabled,
         invisibleChars: liveSettings.invisibleCharsEnabled,
@@ -401,25 +445,47 @@ async function _run(campaignId: string): Promise<void> {
         diacritics:     true,
       });
 
-      // ── Spam score gate (NEW v2) ─────────────────────────────────────
-      // Check the final composed message, not just the template.
+      // ── Spam score gate ────────────────────────────────────────────────
       const spamScore = calculateSpamScore(text);
       if (spamScore.risk === "high") {
         logger.warn({ campaignId, phone, score: spamScore.score, reasons: spamScore.reasons },
           "message skipped: high spam score");
-        // Don't fail permanently — just skip this iteration, adjust template
         await sleep(5000);
         continue;
       }
 
       await db.update(messagesTable).set({ body: text, accountId }).where(eq(messagesTable.id, msg.id));
 
-      // ── Organic breathing (NEW v2) ───────────────────────────────────
-      // Occasionally do "other things" before sending the next message.
+      // ── Organic breathing — إصلاح: ترسل presence signals حقيقية ─────
       await organicBreathe(accountId);
 
-      // ── Send ─────────────────────────────────────────────────────────
-      const result = await workerSendMessage(accountId, phone, text);
+      // ── Send — مع retry بحساب مختلف ──────────────────────────────────
+      let result = await workerSendMessage(accountId, phone, text);
+
+      // إصلاح: إذا فشل الإرسال، نحاول بحساب مختلف (حتى maxRetries)
+      if (!result.ok && liveSettings.maxRetries > 1) {
+        failedAccountsThisMsg.add(accountId);
+        for (let attempt = 1; attempt < liveSettings.maxRetries && !result.ok; attempt++) {
+          const altAccount = await pickAccount(accountIds, liveSettings, failedAccountsThisMsg);
+          if (!altAccount) break;
+
+          logger.info({
+            campaignId, phone, failedAccount: accountId, retryAccount: altAccount, attempt,
+          }, "retrying with different account");
+
+          await recordFailure(accountId, liveSettings, result.error);
+          await sleep(liveSettings.retryDelayMin * 60_000);
+
+          // أعد فحص kill switch قبل كل retry
+          const [recheck] = await db.select().from(campaignsTable).where(eq(campaignsTable.id, campaignId));
+          if (!recheck || recheck.status !== "running") return;
+
+          accountId = altAccount;
+          await db.update(messagesTable).set({ accountId }).where(eq(messagesTable.id, msg.id));
+          result = await workerSendMessage(accountId, phone, text);
+          if (!result.ok) failedAccountsThisMsg.add(accountId);
+        }
+      }
 
       if (result.ok) {
         await db.update(messagesTable)
@@ -432,21 +498,15 @@ async function _run(campaignId: string): Promise<void> {
           campaignId, phone, accountId,
           health: getCachedHealth(accountId),
           spamScore: spamScore.score,
+          timezone: SEND_TIMEZONE,
+          hour: currentHourInTz(),
         }, "sent ✓");
       } else {
         await recordFailure(accountId, liveSettings, result.error);
-        const retries = msg.retryCount + 1;
-        if (retries >= liveSettings.maxRetries) {
-          await db.update(messagesTable)
-            .set({ status: "failed", error: result.error, retryCount: retries })
-            .where(eq(messagesTable.id, msg.id));
-        } else {
-          await db.update(messagesTable)
-            .set({ retryCount: retries, error: result.error })
-            .where(eq(messagesTable.id, msg.id));
-          await sleep(liveSettings.retryDelayMin * 60_000);
-          continue;
-        }
+        const retries = msg.retryCount + (failedAccountsThisMsg.size || 1);
+        await db.update(messagesTable)
+          .set({ status: "failed", error: result.error, retryCount: retries })
+          .where(eq(messagesTable.id, msg.id));
       }
 
       // ── Batch pause ───────────────────────────────────────────────────
