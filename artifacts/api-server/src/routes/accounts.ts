@@ -229,11 +229,15 @@ router.post("/accounts/:id/ban", async (req, res) => {
   }
 
   if (affected.length > 0) {
+    // إصلاح: نُوقف الـ campaign في DB فقط — لا نُزيل من runningCampaigns في الذاكرة.
+    // حلقة _run() ستكتشف status="paused" من DB في التكرار التالي وتخرج بشكل نظيف.
+    // إزالة قسرية من runningCampaigns خطرة — تسمح بإعادة دخول runCampaign
+    // قبل أن تُنهي _run() تنظيفها الداخلي.
     await db.update(campaignsTable)
       .set({ status: "paused" })
       .where(inArray(campaignsTable.id, affected));
     logger.warn({ accountId, reason, affectedCampaigns: affected.length },
-      "ACCOUNT BANNED — campaigns paused");
+      "ACCOUNT BANNED — campaigns marked paused in DB (runner will self-exit on next loop)");
   }
 
   sessionCache = {};

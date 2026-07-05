@@ -419,10 +419,19 @@ async function _run(campaignId: string): Promise<void> {
       let accountId = await pickAccount(accountIds, liveSettings, failedAccountsThisMsg);
 
       if (!accountId) {
-        // قد يكون كل الحسابات وصلت حدها الساعي — انتظر دقيقتين وأعد المحاولة
-        logger.warn({ campaignId }, "no account available (hourly/daily limits?) — sleep 2min");
-        await sleep(2 * 60_000);
-        break; // أعد المحاولة في الـ batch التالي
+        // قد يكون كل الحسابات وصلت حدها الساعي أو اليومي.
+        // إصلاح: كان break يُنهي الحملة بالكامل — الصح هو continue (انتظار ثم إعادة المحاولة)
+        // نحسب أقصر وقت انتظار قبل أن تُفتح نافذة ساعية لأي حساب.
+        const minWait = Math.min(
+          ...[...hourlySentMap.entries()]
+            .filter(([id]) => accountIds.includes(id))
+            .map(([, entry]) => Math.max(0, 3_600_000 - (Date.now() - entry.hourStart))),
+          2 * 60_000,  // fallback: دقيقتان
+        );
+        logger.warn({ campaignId, waitMs: minWait },
+          "no account available (hourly/daily limits?) — sleeping until a slot opens");
+        await sleep(minWait + 5000); // +5s هامش أمان
+        continue; // أعد الـ while loop (لا تُنهِ الحملة)
       }
 
       // ── WhatsApp phone check ──────────────────────────────────────────
